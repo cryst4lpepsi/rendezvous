@@ -24,7 +24,7 @@ that the PC didn't ask for. The app works around that in layers, best first:
 |---|---|---|
 | Host's router allows automatic port opening (UPnP / NAT-PMP) | opens a port, gives a **10-digit code** that encodes the host's address | directly between PCs |
 | Host is behind the provider's shared address (**CGNAT**), or the router won't open a port | uses **hole punching**: both sides send to each other at the same moment so both routers let the replies in. Gives a **6-digit code** | directly between PCs |
-| One side's router scrambles ports on every connection (**symmetric NAT**), so punching can't work | goes through a public **TURN relay** to reach the host, and through the host to reach the other players | through the host / relay |
+| One side's router scrambles ports on every connection (**symmetric NAT**), so punching can't work | reaches the host through a **TURN relay** if one is available (see below), and the other players through the host. Without a relay: someone else hosts, or a small cloud server is used | through the host / relay |
 | Two players can't reach each other directly even inside the network | that pair's packets go **through the host's server** (RELAY) | through the host |
 
 Each pair of players picks its own path and switches automatically if a path
@@ -35,8 +35,12 @@ dies. The window shows every connection live: green **DIRECT**, amber
 middle. Rendezvous runs the meeting point on the host's PC instead, so there's
 no account and no company server. It only uses two free public services
 (STUN, a "what's my address" service, and ntfy.sh, a message board) to swap
-addresses when the host is behind CGNAT. In that case it can also use a free
-TURN relay for players who can't punch.
+addresses when the host is behind CGNAT. For players who can't punch through
+to a CGNAT host, it can also use a TURN relay. Honest note: the free public
+relays it tries didn't answer in our last tests, so in practice this needs
+your own relay (`RENDEZVOUS_TURN`). The simpler fixes are to let someone else
+host, or to run `rendezvous_server.py` on a free cloud VM. That is exactly
+the job Radmin's company servers do.
 
 ## 2. The parts
 
@@ -123,9 +127,10 @@ TURN relay for players who can't punch.
 - **CGNAT.** STUN + encrypted mailbox + coordinated hole punching. The host
   re-checks its public address every 20 s and re-posts it if it changes. The
   code never changes.
-- **Symmetric NAT.** Detected (two STUN servers see different ports). The
-  joiner alternates between the host's direct address and its TURN relay
-  address. Players that can't punch each other use the host as relay.
+- **Symmetric NAT.** Detected (two STUN servers see different ports). When
+  the host has a TURN relay, the joiner alternates between the host's direct
+  address and the relay address. Players that can't punch each other use the
+  host as relay. The host keeps trying to get a relay every 5 minutes.
 - **Same house.** LAN broadcast discovery, because many routers can't loop
   traffic back to their own public address (no "hairpin NAT").
 - **Watchdog.** Silence on a direct path for 3.5 s means it's dead: switch to
@@ -178,6 +183,7 @@ Before the demo:
 | One player stays `RELAY` | their network blocks punching (mobile data, university Wi-Fi) | Works as is, slightly higher ping. |
 | Friends see the world but can't join it | the host once answered the game's firewall prompt with "Private only", so Windows blocks it on Public networks | The app marks the virtual LAN as a **Private** network, so this normally can't happen. If the log says it couldn't, open *Windows Security → Firewall → Allow an app*, find **Java(TM) Platform SE binary** (Minecraft Java) or the game, and tick **Public** too. |
 | Game doesn't list the LAN world | game's own firewall prompt was denied; different game versions | Allow the game in Windows Firewall. Check versions match. Use **Direct connect** to `10.77.0.x` (Minecraft LAN worlds use a random port shown in chat on the host). |
+| LAN list stays empty, but `ping 10.77.0.x` works | another VPN (Radmin VPN, Hamachi, ZeroTier) also claims to be the preferred network, so the game's broadcast goes out there | Quit the other VPN or disable its adapter while playing. Or use the game's **Direct connect** with the host's `10.77.0.x` address. |
 | "Virtual LAN unavailable" | admin prompt declined | Restart and accept it. |
 | SmartScreen "Windows protected your PC" | exe isn't code-signed | **More info → Run anyway**. |
 | Antivirus deletes the exe | unsigned one-file Python exe (a common false positive) | Restore and allow it, or run from source: `py -m pip install -r requirements.txt`, then `py app.py`. |
@@ -301,7 +307,9 @@ the host's own PC.
 **Limits, honestly**
 - No encryption of game traffic.
 - IPv4 only, 8 players.
-- Depends on the free STUN / ntfy / TURN services in the CGNAT case. All of
+- Depends on the free STUN and ntfy services in the CGNAT case. The free
+  TURN relays it tries were down in our tests, so a symmetric-NAT friend of a
+  CGNAT host needs a relay you provide, or a different host. All of
   them can be swapped with environment variables (`RENDEZVOUS_STUN`,
   `RENDEZVOUS_MAILBOX`, `RENDEZVOUS_TURN`).
 - Unsigned exe.

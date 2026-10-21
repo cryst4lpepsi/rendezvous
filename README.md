@@ -152,11 +152,13 @@ player only, or on everyone when no player is selected.
   code (see above), which works with most connections. If a friend gets
   *"couldn't punch through to the host … symmetric NAT"*, one of the two
   connections changes ports for every destination, which hole punching can't
-  get through. The host's app keeps a free public **TURN relay** ready for
-  that case, and the friend's app tries it automatically. The message only
-  appears when that relay can't be reached either. Then let someone else
-  host, use a cloud server (below), or name your own TURN server with
-  `RENDEZVOUS_TURN=host:port:user:pass`.
+  get through. Let someone else host (the friend with the strict
+  connection, or anyone without CGNAT), or use a cloud server (below). The
+  app also supports a **TURN relay** for this case: the host's app gets an
+  address on the relay, and the friend's app switches to it automatically.
+  The free public relays it tries by default didn't answer in our last
+  tests, so set your own with `RENDEZVOUS_TURN=host:port:user:pass` (e.g.
+  coturn on a cloud VM).
 - **"Couldn't reach the host"** when joining: check the network name and code,
   that the host has Rendezvous open, and that their port is open (see above).
 - **A player stays on RELAY**: their network blocks hole punching (symmetric
