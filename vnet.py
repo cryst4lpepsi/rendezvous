@@ -148,10 +148,13 @@ class LinuxTun(_Base):
 def _wintun_dll_path():
     """Find wintun.dll next to the exe/script; download it (hash-checked) if missing."""
     arch = {"AMD64": "amd64", "x86_64": "amd64", "ARM64": "arm64", "x86": "x86"}.get(platform.machine(), "amd64")
-    dirs = [Path(getattr(sys, "_MEIPASS", "")), Path(sys.executable).parent, Path(__file__).resolve().parent, Path.cwd()]
+    dirs = [Path(sys.executable).parent, Path(__file__).resolve().parent, Path.cwd()]
+    if getattr(sys, "_MEIPASS", None):  # inside the PyInstaller exe
+        dirs.insert(0, Path(sys._MEIPASS))
     for d in dirs:
-        if str(d) and (d / "wintun.dll").is_file():
-            return d / "wintun.dll"
+        if (d / "wintun.dll").is_file():
+            # Absolute path: Windows won't load a DLL from a bare relative name.
+            return (d / "wintun.dll").resolve()
     target = Path(__file__).resolve().parent / "wintun.dll"
     log.info("wintun.dll not found, downloading %s", WINTUN_URL)
     try:
