@@ -101,6 +101,11 @@ def make_udp_socket(host, port):
     return sock
 
 
+def _private(ip):
+    a = ipaddress.ip_address(ip)
+    return a.is_private or a.is_loopback or a.is_link_local
+
+
 class PeerRecord:
     def __init__(self, pid, name, public, local, vip):
         self.id = pid
@@ -112,9 +117,9 @@ class PeerRecord:
         self.first_seen = time.time()
         self.last_seen = time.time()
 
-    def info(self):
+    def info(self, public=None):
         return {"t": "peer", "id": self.id, "name": self.name, "vip": self.vip,
-                "public": list(self.public), "local": list(self.local) if self.local else None}
+                "public": list(public or self.public), "local": list(self.local) if self.local else None}
 
 
 class Room:
@@ -143,6 +148,11 @@ class RendezvousServer:
         self.lock = threading.Lock()   # the HTTP status thread reads self.rooms
         self.started = time.time()
         self._last_expire = 0.0
+        self.running = True
+        # Used when a player hosts the server inside the app (see hosting.py):
+        self.only_room = None   # serve just this network
+        self.public_ip = None   # the host's public IP, to describe peers that sit on the host's LAN
+        self.overrides = {}     # port of a peer on this machine -> its port-forwarded (ip, port)
 
     # ------------------------------------------------------------------ io
     def send(self, msg, addr):
@@ -158,7 +168,7 @@ class RendezvousServer:
         self.sock.settimeout(1.0)
         log.info("UDP rendezvous/relay listening on %s:%d, virtual LAN %s",
                  *self.sock.getsockname(), self.subnet)
-        while True:
+        while self.running:
             try:
                 data, addr = self.sock.recvfrom(MAX_DATAGRAM)
             except socket.timeout:
@@ -167,6 +177,10 @@ class RendezvousServer:
                 continue
             except ConnectionResetError:
                 continue  # stray ICMP on Windows; harmless
+            except OSError:
+                if not self.running:
+                    break
+                raise
             with self.lock:
                 if data and data[0] == BIN_RELAY:
                     self.on_binary_relay(data, addr)
@@ -193,6 +207,22 @@ class RendezvousServer:
         else:
             log.debug("drop: unknown message type %r from %s", t, addr)
 
+    def endpoint_for(self, rec, viewer=None):
+        """
+        The address other players should use to reach `rec`. Normally that is
+        simply where its packets came from. But when the server runs inside the
+        host's app, the host (and anyone on the host's LAN) registers from a
+        local address that means nothing to players outside, so we hand those
+        players the host's public IP instead (and the forwarded port, if UPnP
+        set one up for it).
+        """
+        ip, port = rec.public
+        if not self.public_ip or not _private(ip) or (viewer is not None and _private(viewer.public[0])):
+            return rec.public
+        if ipaddress.ip_address(ip).is_loopback and port in self.overrides:
+            return self.overrides[port]
+        return (self.public_ip, port)
+
     def assign_vip(self, room, want):
         """Hand out the lowest free host address, or the one the peer asks for
         (it remembers its last address so players keep the same IP)."""
@@ -213,6 +243,8 @@ class RendezvousServer:
         except ValueError:
             return self.send({"t": "error", "reason": "register needs a room and a 6-hex-digit id"}, addr)
         local = tuple(msg["local"]) if msg.get("local") else None
+        if self.only_room is not None and code != self.only_room:
+            return self.send({"t": "error", "reason": "wrong network name or password"}, addr)
         room = self.rooms.setdefault(code, Room(code))
         rec = room.peers.get(pid)
 
@@ -240,16 +272,16 @@ class RendezvousServer:
 
         # Tell the peer what its public endpoint looks like from the outside,
         # and which virtual IP it owns.
-        self.send({"t": "registered", "public": list(addr), "room": code,
+        self.send({"t": "registered", "public": list(self.endpoint_for(rec)), "room": code,
                    "vip": rec.vip, "prefix": self.subnet.prefixlen}, addr)
 
         # Introduction: give each peer every other peer's endpoints. We re-send
         # on every register so a lost packet is self-healing.
         for other in room.others(pid):
-            self.send(other.info(), addr)
+            self.send(other.info(self.endpoint_for(other, rec)), addr)
             if changed:
                 log.info("[%s] INTRODUCE %s <-> %s", code, rec.name, other.name)
-                self.send(rec.info(), other.public)
+                self.send(rec.info(self.endpoint_for(rec, other)), other.public)
 
     def _sender(self, code, pid, addr):
         room = self.rooms.get(code)

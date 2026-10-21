@@ -80,6 +80,21 @@ def main():
     api(8180, "/api/cmd", {"cmd": "repunch"})
     ok.append(wait(lambda: states(8180) == ["DIRECT", "DIRECT"], 8, "Re-punch -> back to DIRECT"))
 
+    # Host mode, no separate server: one peer hosts, another joins with the invite code.
+    start([PY, "peer.py", "--host", "--no-upnp", "--host-port", "9300", "--room", "hostci", "--password", "pw",
+           "--name", "hoster", "--http-port", "8380"], "ci-hoster.log")
+    ok.append(wait(lambda: bool(api(8380)["invite"]), 20, "host mode: hoster gets an invite code"))
+    invite = api(8380)["invite"]
+    start([PY, "peer.py", "--invite", invite, "--name", "joiner", "--http-port", "8381"], "ci-joiner.log")
+    ok.append(wait(lambda: states(8381) == ["DIRECT"] and states(8380) == ["DIRECT"], 20,
+                   "host mode: joiner connects with the invite code, DIRECT both ways"))
+    sys.path.insert(0, str(ROOT))
+    import hosting
+    bad = hosting.make_invite(hosting.parse_invite(invite)["server"], "hostci", "wrong-password")
+    start([PY, "peer.py", "--invite", bad, "--name", "intruder", "--http-port", "8382"], "ci-intruder.log")
+    ok.append(wait(lambda: api(8382)["joined"] is False and len(api(8380)["peers"]) == 1, 15,
+                   "host mode: wrong password is refused"))
+
     if args.exe:
         # The app is a Qt window; --api adds the JSON API so the test can watch it.
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")

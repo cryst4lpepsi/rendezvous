@@ -4,8 +4,12 @@ Rendezvous puts up to 8 PCs on the same virtual LAN over the internet, like
 Radmin VPN or Hamachi. LAN games see each other as if the PCs were plugged
 into the same switch.
 
-- A small **rendezvous server** introduces the players and gives each one a
-  virtual IP (`10.77.0.x`).
+- One player clicks **Host a network**. Their app runs the **rendezvous
+  server**, opens the router port with UPnP, and gives them an **invite code**.
+  Everyone else clicks **Join a network** and pastes it. No cloud server or
+  account is needed. A cloud server still works for networks that can't host.
+- The server introduces the players and gives each one a virtual IP
+  (`10.77.0.x`).
 - Every pair of players tries **UDP hole punching** to get a **direct**
   connection, and falls back to **relaying through the server** if that fails.
   Each pair decides this on its own.
@@ -18,7 +22,8 @@ into the same switch.
 ![The app with three players: dave direct, bob on relay (forced), carol reconnecting after its direct path was dropped](docs/app.png)
 
 ```
-app.py                 the desktop app (what Rendezvous.exe runs): native Qt window
+app.py                 the desktop app (what Rendezvous.exe runs): native Qt window, Host / Join
+hosting.py             hosting from the app: built-in server, UPnP port forwarding, invite codes
 peer.py                the engine: per-player state machines, tunnel, virtual LAN routing; web dashboard for the CLI demo
 vnet.py                the virtual adapter: Wintun on Windows, /dev/net/tun on Linux
 dashboard.html         the web dashboard used by the command-line demo (peer.py)
@@ -30,48 +35,40 @@ tools/                 test scripts: NAT lab, Wintun smoke test, CI end-to-end t
 
 ## Playing LAN games with friends
 
-### 1. Run the server (once, on any machine with a public IP)
-
-A small cloud VM is enough. The server is a single file with no dependencies.
-
-```
-python3 rendezvous_server.py
-```
-
-Allow **UDP 9000** inbound in the VM's firewall / security group. TCP 9001 is
-an optional JSON status page. To keep it running after you log out, start it
-inside `tmux` or `screen`.
-
-### 2. Every player runs the app
-
 Download **Rendezvous.exe** from the latest successful
 [Windows app](../../actions/workflows/windows-app.yml) build (open the run, then
-the *Rendezvous-windows* artifact). Then:
+the *Rendezvous-windows* artifact). Every player uses the same exe. Start it and
+accept the administrator prompt: creating a network adapter needs admin rights,
+as with Radmin. Windows SmartScreen may warn because the exe isn't signed; use
+*More info → Run anyway*.
 
-1. Double-click **Rendezvous.exe** and accept the administrator prompt.
-   Creating a network adapter needs admin rights, as with Radmin.
-2. In the **Join a network** window, enter:
-   - the server (`<server-ip>:9000`),
-   - a network name and an optional password, the same for everyone,
-   - your name.
-3. Your virtual IP appears at the top right, e.g. **10.77.0.2**. Each other
+### Host (one player)
+
+1. Click **Host a network**. Choose a network name and password, enter your
+   name, and click **Start hosting**.
+2. The app starts the network on your PC and asks your router to forward its
+   port (UPnP). The **Invite friends** window then shows:
+   - your **invite code** (`RZ1-…`), with a **Copy code** button;
+   - whether the port was opened (✓), or what to do if it wasn't (⚠).
+3. Send the code to your friends. Keep Rendezvous open while you play: the
+   network runs on your PC. **Stop hosting** closes it and removes the port
+   forwarding.
+
+### Join (everyone else)
+
+1. Copy the invite code, click **Join a network**, paste it (it fills itself in
+   if it's on the clipboard), enter your name, and click **Join**.
+2. Your virtual IP appears at the top right, e.g. **10.77.0.2**. Each other
    player shows up as a node and goes **PUNCHING → DIRECT** (or **RELAY**).
+   Friends in the host's own house also work: if the router can't route
+   back to its own public address, the app switches to the host's LAN address
+   by itself.
 
-The app remembers the network and rejoins it next time. Closing the window
-quits the app and removes the adapter.
+The app remembers your network and reconnects next time (a host hosts again).
+**Invite friends…** is available to everyone in the network. Closing the window
+leaves the network and removes the adapter.
 
-Select a player in the list (or click its node) to see its details. The
-**Force Relay / Re-punch / Drop Direct** buttons (keys R / P / D) then act on
-that player only, or on everyone when no player is selected.
-
-`Rendezvous-console.exe` is the same app with a console window showing the log,
-which helps with troubleshooting. Both write a log to `%APPDATA%\Rendezvous\`.
-Use **Network → Open log folder** to find it.
-
-To run the app from source instead: `py -m pip install -r requirements.txt`,
-then `py app.py` in an administrator terminal.
-
-### 3. Play
+### Play
 
 - One player hosts a **LAN game**. The others find it in their game's LAN
   list, because broadcasts and multicast are carried across. If a game doesn't
@@ -79,17 +76,48 @@ then `py app.py` in an administrator terminal.
 - Anything that runs over IPv4 works, both TCP and UDP. In testing, TCP
   managed about 15 MB/s through the tunnel.
 
-**If something doesn't work:**
-- **"Rendezvous server not responding"**: wrong address, or UDP 9000 is not
-  open on the server.
+Select a player in the list (or click its node) to see its details. The
+**Force Relay / Re-punch / Drop Direct** buttons (keys R / P / D) act on that
+player only, or on everyone when no player is selected.
+
+### If something doesn't work
+
+- **The invite window shows ⚠ "Couldn't open the port automatically"**: your
+  router has UPnP turned off. Turn it on in the router settings, or forward
+  **UDP 9000** to the PC shown in the message. Friends on your own network can
+  join either way.
+- **⚠ "not public … CGNAT"**: your internet provider shares one public address
+  between many customers, so nobody outside can reach you. Let a friend with a
+  normal connection host, or use a cloud server (below).
+- **"Rendezvous server not responding"** when joining: the host isn't running
+  or isn't reachable (see above).
 - **A player stays on RELAY**: their network blocks hole punching (symmetric
-  NAT, CGNAT on many mobile networks). It still works, just through the server.
+  NAT, CGNAT on many mobile networks). It still works, just through the host.
 - **The game doesn't see the host**: check the host's virtual IP is pingable
   (`ping 10.77.0.x`). The app adds a firewall rule allowing inbound traffic
   from the virtual LAN. A game with its own firewall prompt still needs to be
   allowed.
-- **The app shows "Virtual LAN unavailable"**: it wasn't started as
-  administrator. The tunnel and chat still work.
+- **"Virtual LAN unavailable"**: the app wasn't started as administrator. The
+  tunnel and chat still work.
+
+`Rendezvous-console.exe` is the same app with a console window showing the log.
+Both write a log to `%APPDATA%\Rendezvous\`; use **Network → Open log folder**.
+
+### Optional: a cloud server instead of hosting
+
+If nobody can host (CGNAT, no UPnP), run the server on any machine with a
+public IP. It's one file with no dependencies:
+
+```
+python3 rendezvous_server.py
+```
+
+Allow **UDP 9000** inbound in its firewall. Then everyone picks **Join a
+network → No code? Enter a rendezvous server**, and enters `<server-ip>:9000`
+plus the same network name and password.
+
+To run the app from source instead of the exe: `py -m pip install -r
+requirements.txt`, then `py app.py` in an administrator terminal.
 
 ## Demo on one laptop (no admin, no adapter)
 
@@ -238,8 +266,19 @@ relays only for the address a peer registered from.
   - With `--symmetric`, bob's router uses random ports. His links genuinely
     fail to punch and use RELAY, while alice↔carol stays DIRECT. Ping,
     broadcast, multicast and TCP still work through the relay.
+- **Hosting through a real UPnP router** (`tools/upnplab.sh`: the same lab with
+  `miniupnpd` on alice's router, no cloud server):
+  - alice hosts. The app finds the router, reads its public IP, and forwards
+    both her server port and her tunnel port.
+  - bob joins from another network with only the invite code: DIRECT.
+  - carol, in alice's house, joins with the same code. The router can't loop
+    back to its own public address, so she falls back to alice's LAN address
+    by herself.
+  - The virtual LAN works across all three. When alice quits, the router
+    forwarding is removed.
 - **`tools/ci_loopback_test.py`**: three peers on loopback reach a full DIRECT
-  mesh. Force Relay, chat over relay and Re-punch work. With `--exe` it also
+  mesh. Force Relay, chat over relay and Re-punch work. In host mode, a peer
+  joins with an invite code and a wrong password is refused. With `--exe` it also
   checks that the built app joins and brings up its adapter.
 - **`tools/wintun_smoke.py`**: on the real adapter, checks outbound unicast,
   subnet and `255.255.255.255` broadcast, multicast, inbound UDP and ping.
@@ -252,6 +291,8 @@ relays only for the address a peer registered from.
 --server HOST:PORT     rendezvous server (default 127.0.0.1:9000)
 --room NAME            network name (default "demo"); --password to protect it
 --name NAME            display name (default: computer name)
+--host                 host the network (built-in server + UPnP); --host-port, --no-upnp
+--invite RZ1-...       join with an invite code
 --vlan                 create the virtual adapter (always on in the app; --no-vlan to disable)
 --http-port N          dashboard port (default 8080)
 --punch-timeout S      punch this long before falling back (default 5)

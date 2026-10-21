@@ -92,7 +92,9 @@ def guess_lan_ip(server_addr):
     # can reach each other on this address even if their router can't hairpin.
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s.connect(server_addr)
+        # A server on this machine (we are hosting) would give 127.0.0.1;
+        # ask about the internet route instead to get the real LAN address.
+        s.connect(("8.8.8.8", 53) if server_addr[0].startswith("127.") else server_addr)
         return s.getsockname()[0]
     except OSError:
         return "127.0.0.1"
@@ -192,6 +194,11 @@ class Peer:
         self.joined = False
         self.server_addr = None
         self.network = None      # network name shown to the user
+        self.password = ""
+        self.server_candidates = []  # [address as typed, fallback (host's LAN address)]
+        self.server_index = 0
+        self.hosting = None      # set while we host the network (see hosting.py)
+        self.hosting_busy = False
         self.room = None         # what the server matches on: "network/password"
         self.my_id = None
         self.my_raw_id = None
@@ -262,6 +269,10 @@ class Peer:
     async def stop(self):
         for t in self._tasks:
             t.cancel()
+        if self.hosting:  # close the router port before exiting
+            import hosting
+            info, self.hosting = self.hosting, None
+            await self.loop.run_in_executor(None, hosting.stop_hosting, info)
         if self.joined:
             self.leave(quiet=True)
         if self.vnet:
@@ -305,18 +316,22 @@ class Peer:
         self.push_state()
 
     # ================================================================ join/leave
-    def join(self, server, network, password="", name=None, remember=True):
+    def join(self, server, network, password="", name=None, remember=True, alt=None):
         if self.joined:
-            self.leave(quiet=True)
+            self.leave(quiet=True, keep_hosting=True)
         network = (network or "").strip()
         if not network:
             self.event("warn", "enter a network name to join")
             return False
+        server = (server or "127.0.0.1:9000").strip()
         try:
-            self.server_addr = resolve(server or "127.0.0.1:9000", 9000)
+            self.server_addr = resolve(server, 9000)
         except (OSError, ValueError) as e:
             self.event("bad", f"cannot resolve server '{server}': {e}")
             return False
+        self.server_candidates = [server] + ([alt] if alt and alt != server else [])
+        self.server_index = 0
+        self.password = password
         if name and name.strip():
             self.name = name.strip()[:32]
         self.network = network
@@ -328,14 +343,22 @@ class Peer:
         self.joined, self.joined_at = True, now()
         self.server_ok = None
         if remember:
-            self._save_config(server=server, network=network, password=password, name=self.name, autojoin=True)
+            self._save_config(mode="join", server=server, alt=alt, network=network, password=password,
+                              name=self.name, autojoin=True)
         self.event("info", f"joining network '{network}' via rendezvous {fmt(self.server_addr)} as {self.name}")
         self._register()
         self.push_state()
         return True
 
-    def leave(self, quiet=False):
+    def leave(self, quiet=False, keep_hosting=False):
+        if self.hosting and not keep_hosting:
+            import hosting
+            info, self.hosting = self.hosting, None
+            self.loop.run_in_executor(None, hosting.stop_hosting, info)
+            if not quiet:
+                self.event("warn", "stopped hosting: the network is closed for everyone")
         if not self.joined:
+            self.push_state()
             return
         self._send_raw({"t": "bye", "room": self.room, "id": self.my_id}, self.server_addr)
         for link in list(self.links.values()):
@@ -345,6 +368,58 @@ class Peer:
             self._save_config(autojoin=False)
             self.event("warn", f"left network '{self.network}'")
         self.push_state()
+
+    def host(self, network, password="", name=None, port=9000, use_upnp=True, remember=True):
+        """Host a network: run the rendezvous server in this app, open the
+        router port with UPnP, then join it ourselves."""
+        if self.hosting_busy:
+            return
+        asyncio.ensure_future(self._host(network, password, name, port, use_upnp, remember))
+
+    async def _host(self, network, password, name, port, use_upnp, remember):
+        import hosting
+        network = (network or "").strip()
+        if not network:
+            self.event("warn", "enter a network name to host")
+            return
+        self.hosting_busy = True
+        self.leave(quiet=True)
+        self.push_state()
+        room = f"{network}/{password}" if password else network
+        self.event("info", f"hosting '{network}': starting the rendezvous server on UDP {port}"
+                           + (" and asking the router to open it (UPnP)..." if use_upnp else "..."))
+        info, err = None, None
+        for p in range(port, port + 10):  # next free port if this one is taken
+            try:
+                info = await self.loop.run_in_executor(None, hosting.start_hosting, p, room, self.udp_port, use_upnp)
+                break
+            except OSError as e:
+                err = e
+        self.hosting_busy = False
+        if info is None:
+            self.event("bad", f"could not start hosting: {err}")
+            self.push_state()
+            return
+        self.hosting = info
+        self.event("good" if info["reachable"] else "warn", info["status"])
+        if remember:
+            self._save_config(mode="host", network=network, password=password, name=(name or self.name),
+                              host_port=port, upnp=use_upnp, autojoin=True)
+        self.join(f"127.0.0.1:{info['server'].port}", network, password, name, remember=False)
+        self.event("good", "hosting - share the invite code with your friends")
+
+    def invite(self):
+        """Invite code for the current network (any member can share it)."""
+        import hosting
+        if not self.joined:
+            return None
+        h = self.hosting
+        if h:
+            lan = f"{h['lan_ip']}:{h['server'].port}" if h["lan_ip"] else None
+            server = f"{h['public_ip']}:{h['server_port']}" if h["public_ip"] else lan
+            return hosting.make_invite(server, self.network, self.password, lan)
+        alt = self.server_candidates[1] if len(self.server_candidates) > 1 else None
+        return hosting.make_invite(self.server_candidates[0], self.network, self.password, alt)
 
     # ============================================================ event bus
     def event(self, level, msg, link=None):
@@ -389,7 +464,12 @@ class Peer:
             "totals": dict(tot),
             "punch_timeout": self.punch_timeout,
             "dead_after": DIRECT_DEAD_AFTER,
-            "saved": {k: self.config.get(k, "") for k in ("server", "network", "name")}
+            "hosting": None if not self.hosting else {
+                "status": self.hosting["status"], "reachable": self.hosting["reachable"],
+                "public_ip": self.hosting["public_ip"], "port": self.hosting["server_port"]},
+            "hosting_busy": self.hosting_busy,
+            "invite": self.invite(),
+            "saved": {k: self.config.get(k, "") for k in ("server", "network", "name", "mode")}
                      | {"has_password": bool(self.config.get("password"))},
             "app_mode": bool(self.args.app_mode),
         }
@@ -465,6 +545,20 @@ class Peer:
             if self.server_ok is False:
                 self.event("good", "rendezvous server reachable again")
             self.server_ok = True
+        elif (not server_ok and self.server_ok is None and len(self.server_candidates) > 1
+              and t - self.joined_at > 4 and self.server_index + 1 < len(self.server_candidates)):
+            # Never got an answer: try the next address from the invite (the
+            # host's LAN address, for friends on the same network).
+            self.server_index += 1
+            addr = self.server_candidates[self.server_index]
+            try:
+                self.server_addr = resolve(addr, 9000)
+            except (OSError, ValueError):
+                return
+            self.joined_at = t
+            self.local_addr = (guess_lan_ip(self.server_addr), self.udp_port)
+            self.event("warn", f"no answer from the public address, trying the host's LAN address {addr}")
+            self._register()
         elif not server_ok and self.server_ok is not False:
             if self.server_ok is True or t - self.joined_at > SERVER_DEAD_AFTER:
                 self.event("bad", f"rendezvous server {fmt(self.server_addr)} not responding "
@@ -780,7 +874,13 @@ class Peer:
             if link:
                 self._drop_link(link, "left the network")
         elif t == "error":
-            self.event("bad", f"server error: {msg.get('reason')}")
+            reason = msg.get("reason") or "error"
+            self.event("bad", f"server error: {reason}")
+            if not self.links and not self.hosting:
+                # Wrong password / network full: stop retrying, tell the UI.
+                self.leave(quiet=True)
+                self._save_config(autojoin=False)
+                self.broadcast({"type": "join_failed", "reason": reason})
         else:
             log.debug("drop: unknown server message %r", t)
 
@@ -868,10 +968,20 @@ class Peer:
             pw = m.get("password")
             if pw is None:  # "keep the saved password"
                 pw = self.config.get("password") or ""
-            return self.join(m.get("server"), m.get("network"), pw, m.get("name"))
+            return self.join(m.get("server"), m.get("network"), pw, m.get("name"), alt=m.get("alt"))
+        if cmd == "join_invite":
+            import hosting
+            try:
+                inv = hosting.parse_invite(m.get("code"))
+            except ValueError as e:
+                self.event("bad", f"invite code: {e}")
+                return False
+            return self.join(inv["server"], inv["network"], inv["password"], m.get("name"), alt=inv["alt"])
+        if cmd == "host":
+            return self.host(m.get("network"), m.get("password") or "", m.get("name"),
+                             int(m.get("port") or 9000), bool(m.get("upnp", True)))
         if cmd == "rejoin":
-            c = self.config
-            return self.join(c.get("server"), c.get("network"), c.get("password") or "", c.get("name"))
+            return self.resume()
         if cmd == "leave":
             return self.leave()
         if cmd == "quit":
@@ -905,6 +1015,15 @@ class Peer:
                 self.event("warn", f"unknown command {cmd!r}")
                 return
         self.push_state()
+
+    def resume(self):
+        """Reconnect to the remembered network (host it again if we hosted it)."""
+        c = self.config
+        if c.get("mode") == "host":
+            self.host(c.get("network"), c.get("password") or "", c.get("name"), int(c.get("host_port") or 9000),
+                      bool(c.get("upnp", True)))
+        elif c.get("network"):
+            self.join(c.get("server"), c.get("network"), c.get("password") or "", c.get("name"), alt=c.get("alt"))
 
     def send_chat(self, text):
         text = text.strip()
@@ -984,13 +1103,17 @@ def stdin_chat(loop, peer):
 
 
 def autojoin(peer, args):
-    """Join from the command line, else the remembered network, else (plain
-    peer.py only) the zero-config local demo."""
-    if args.server or args.room:
+    """Host or join from the command line, else resume the remembered network,
+    else (plain peer.py only) the zero-config local demo."""
+    if args.host:
+        peer.host(args.room or "demo", args.password or "", args.name, args.host_port,
+                  use_upnp=not args.no_upnp, remember=False)
+    elif args.invite:
+        peer.command({"cmd": "join_invite", "code": args.invite, "name": args.name})
+    elif args.server or args.room:
         peer.join(args.server or "127.0.0.1:9000", args.room or "demo", args.password or "", remember=False)
     elif peer.config.get("autojoin") and peer.config.get("network"):
-        c = peer.config
-        peer.join(c.get("server"), c["network"], c.get("password") or "", c.get("name"))
+        peer.resume()
     elif not args.app_mode:
         peer.join("127.0.0.1:9000", "demo", remember=False)
 
@@ -1035,6 +1158,11 @@ def build_parser():
     ap.add_argument("--room", help="network name; all players must use the same one (default 'demo')")
     ap.add_argument("--password", help="network password (optional, must match)")
     ap.add_argument("--name", help="display name (default: computer name)")
+    ap.add_argument("--host", action="store_true",
+                    help="host the network: run the rendezvous server in this process (with --room/--password)")
+    ap.add_argument("--host-port", type=int, default=9000, help="UDP port when hosting (default 9000)")
+    ap.add_argument("--no-upnp", action="store_true", help="when hosting, don't ask the router to open the port")
+    ap.add_argument("--invite", help="join using an invite code (RZ1-...)")
     ap.add_argument("--vlan", action="store_true",
                     help="create the virtual LAN adapter (needs admin/root) so LAN games can see each other")
     ap.add_argument("--bind", default="0.0.0.0", help="UDP bind address")

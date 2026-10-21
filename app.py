@@ -32,9 +32,10 @@ from PySide6.QtGui import (QAction, QBrush, QColor, QFont, QFontMetrics, QIcon, 
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QFrame,
                                QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
-                               QProgressBar, QPushButton, QSplitter, QTextEdit, QTreeWidget, QTreeWidgetItem,
-                               QVBoxLayout, QWidget)
+                               QProgressBar, QPushButton, QSplitter, QStackedWidget, QTextEdit, QTreeWidget,
+                               QTreeWidgetItem, QVBoxLayout, QWidget)
 
+import hosting
 import peer
 
 log = logging.getLogger("app")
@@ -271,8 +272,9 @@ class Topology(QWidget):
         p.drawRoundedRect(box, 16, 16)
         self._text(p, QRectF(box.x(), box.y() + 12, box.width(), 22), "RENDEZVOUS · RELAY", TEXT, 14, True,
                    Qt.AlignHCenter, spacing=2)
+        where = (f"on this PC · UDP {s['hosting']['port']}" if s.get("hosting") else s["server"])
         self._text(p, QRectF(box.x(), box.y() + 36, box.width(), 20),
-                   s["server"] + ("   ✕ unreachable" if s["server_ok"] is False else ""), MUTED, 13,
+                   where + ("   ✕ unreachable" if s["server_ok"] is False else ""), MUTED, 13,
                    align=Qt.AlignHCenter, mono=True)
 
         # you
@@ -424,62 +426,224 @@ class Topology(QWidget):
 
 
 # ================================================================ join dialog
-class JoinDialog(QDialog):
-    def __init__(self, parent, saved, my_name):
+class StartDialog(QDialog):
+    """Host a network, or join one with an invite code."""
+
+    def __init__(self, parent, saved, my_name, page="choose"):
         super().__init__(parent)
-        self.setWindowTitle("Join a network")
-        self.setMinimumWidth(440)
+        self.setWindowTitle("Rendezvous")
+        self.setMinimumWidth(500)
+        self.result_cmd = None
+        self.stack = QStackedWidget()
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(22, 18, 22, 16)
-        lay.setSpacing(10)
-        title = QLabel("Join a network")
-        title.setObjectName("dialogTitle")
-        lay.addWidget(title)
-        info = QLabel("Everyone who enters the same server, network name and password ends up on one virtual LAN.")
-        info.setWordWrap(True)
-        info.setObjectName("muted")
-        lay.addWidget(info)
-        form = QFormLayout()
-        self.server = QLineEdit(saved.get("server") or "")
-        self.server.setPlaceholderText("203.0.113.10:9000")
-        self.network = QLineEdit(saved.get("network") or "")
-        self.network.setPlaceholderText("friday-games")
-        self.password = QLineEdit()
-        self.password.setEchoMode(QLineEdit.Password)
-        self.password.setPlaceholderText("optional" + (" (leave empty to keep the saved one)" if saved.get("has_password") else ""))
-        self.name = QLineEdit(saved.get("name") or my_name or "")
-        self.name.setMaxLength(32)
-        form.addRow("Rendezvous server", self.server)
-        form.addRow("Network name", self.network)
-        form.addRow("Password", self.password)
-        form.addRow("Your name", self.name)
-        lay.addLayout(form)
+        lay.setContentsMargins(24, 20, 24, 18)
+        lay.addWidget(self.stack)
+        name = saved.get("name") or my_name or ""
+
+        # --- page 0: choose
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(12)
+        t = QLabel("Play LAN games over the internet")
+        t.setObjectName("dialogTitle")
+        v.addWidget(t)
+        sub = QLabel("One player hosts the network and shares an invite code. Everyone else joins with it.")
+        sub.setObjectName("muted")
+        sub.setWordWrap(True)
+        v.addWidget(sub)
+        for title, text, page_i in (("Host a network", "Create a network on this PC and invite your friends.", 1),
+                                    ("Join a network", "Paste the invite code a friend sent you.", 2)):
+            b = QPushButton(f"{title}\n{text}")
+            b.setObjectName("choice")
+            b.setMinimumHeight(74)
+            b.clicked.connect(lambda _=False, i=page_i: self.stack.setCurrentIndex(i))
+            v.addWidget(b)
+        v.addStretch(1)
+        self.stack.addWidget(w)
+
+        # --- page 1: host
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        t = QLabel("Host a network")
+        t.setObjectName("dialogTitle")
+        v.addWidget(t)
+        f = QFormLayout()
+        self.h_net = QLineEdit(saved.get("network") or "")
+        self.h_net.setPlaceholderText("friday-games")
+        self.h_pass = QLineEdit()
+        self.h_pass.setEchoMode(QLineEdit.Password)
+        self.h_pass.setPlaceholderText("so only your friends can join")
+        self.h_name = QLineEdit(name)
+        self.h_name.setMaxLength(32)
+        f.addRow("Network name", self.h_net)
+        f.addRow("Password", self.h_pass)
+        f.addRow("Your name", self.h_name)
+        v.addLayout(f)
+        self.h_adv = QCheckBox("Advanced")
+        v.addWidget(self.h_adv)
+        adv = QWidget()
+        af = QFormLayout(adv)
+        af.setContentsMargins(0, 0, 0, 0)
+        self.h_port = QLineEdit("9000")
+        self.h_upnp = QCheckBox("Open the port on my router automatically (UPnP)")
+        self.h_upnp.setChecked(True)
+        af.addRow("UDP port", self.h_port)
+        af.addRow("", self.h_upnp)
+        adv.setVisible(False)
+        self.h_adv.toggled.connect(adv.setVisible)
+        v.addWidget(adv)
+        note = QLabel("Keep Rendezvous open while you play: the network runs on this PC.")
+        note.setObjectName("muted")
+        note.setWordWrap(True)
+        v.addWidget(note)
+        v.addStretch(1)
+        v.addWidget(self._buttons("Start hosting", self._host))
+        self.stack.addWidget(w)
+
+        # --- page 2: join
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        t = QLabel("Join a network")
+        t.setObjectName("dialogTitle")
+        v.addWidget(t)
+        f = QFormLayout()
+        self.j_code = QLineEdit()
+        self.j_code.setPlaceholderText("RZ1-...  (paste the code your friend sent)")
+        self.j_name = QLineEdit(name)
+        self.j_name.setMaxLength(32)
+        f.addRow("Invite code", self.j_code)
+        f.addRow("Your name", self.j_name)
+        v.addLayout(f)
+        self.j_manual = QCheckBox("No code? Enter a rendezvous server instead")
+        v.addWidget(self.j_manual)
+        man = QWidget()
+        mf = QFormLayout(man)
+        mf.setContentsMargins(0, 0, 0, 0)
+        self.j_server = QLineEdit(saved.get("server") if saved.get("mode") == "join" else "")
+        self.j_server.setPlaceholderText("203.0.113.10:9000")
+        self.j_net = QLineEdit(saved.get("network") or "")
+        self.j_pass = QLineEdit()
+        self.j_pass.setEchoMode(QLineEdit.Password)
+        mf.addRow("Server", self.j_server)
+        mf.addRow("Network name", self.j_net)
+        mf.addRow("Password", self.j_pass)
+        man.setVisible(False)
+        self.j_manual.toggled.connect(man.setVisible)
+        self.j_manual.toggled.connect(lambda on: self.j_code.setEnabled(not on))
+        v.addWidget(man)
+        v.addStretch(1)
+        v.addWidget(self._buttons("Join", self._join))
+        self.stack.addWidget(w)
+
         self.err = QLabel()
         self.err.setObjectName("error")
+        self.err.setWordWrap(True)
         lay.addWidget(self.err)
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText("Join")
-        buttons.accepted.connect(self._check)
-        buttons.rejected.connect(self.reject)
-        lay.addWidget(buttons)
-        (self.network if self.server.text() else self.server).setFocus()
-        self.saved = saved
+        self.stack.currentChanged.connect(lambda _: self.err.clear())
+        self.stack.setCurrentIndex({"host": 1, "join": 2}.get(page, 0))
+        clip = (QApplication.clipboard().text() or "").strip()
+        if clip.upper().startswith(hosting.INVITE_PREFIX):
+            self.j_code.setText(clip)  # a code was just copied: save a step
 
-    def _check(self):
-        server = self.server.text().strip()
-        host, _, port = server.partition(":")
-        if not host or " " in server or (port and not port.isdigit()):
-            self.err.setText("Server should look like 203.0.113.10:9000")
-            return
-        if not self.network.text().strip():
-            self.err.setText("Enter a network name")
-            return
+    def _buttons(self, ok_text, ok):
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 10, 0, 0)
+        back = QPushButton("Back")
+        back.setObjectName("small")
+        back.clicked.connect(lambda: self.stack.setCurrentIndex(0))
+        h.addWidget(back)
+        h.addStretch(1)
+        go = QPushButton(ok_text)
+        go.setObjectName("primary")
+        go.setDefault(True)
+        go.clicked.connect(ok)
+        h.addWidget(go)
+        return row
+
+    def _host(self):
+        net = self.h_net.text().strip()
+        if not net:
+            return self.err.setText("Give your network a name.")
+        if not self.h_port.text().strip().isdigit():
+            return self.err.setText("The port must be a number (9000 is fine).")
+        self.result_cmd = {"cmd": "host", "network": net, "password": self.h_pass.text(),
+                           "name": self.h_name.text().strip(), "port": int(self.h_port.text()),
+                           "upnp": self.h_upnp.isChecked()}
         self.accept()
 
-    def values(self):
-        server = self.server.text().strip()
-        return {"server": server if ":" in server else server + ":9000", "network": self.network.text().strip(),
-                "password": self.password.text(), "name": self.name.text().strip()}
+    def _join(self):
+        name = self.j_name.text().strip()
+        if self.j_manual.isChecked():
+            server = self.j_server.text().strip()
+            host_, _, port = server.partition(":")
+            if not host_ or " " in server or (port and not port.isdigit()):
+                return self.err.setText("Server should look like 203.0.113.10:9000")
+            if not self.j_net.text().strip():
+                return self.err.setText("Enter the network name.")
+            self.result_cmd = {"cmd": "join", "server": server if ":" in server else server + ":9000",
+                               "network": self.j_net.text().strip(), "password": self.j_pass.text(), "name": name}
+        else:
+            try:
+                hosting.parse_invite(self.j_code.text())
+            except ValueError as e:
+                return self.err.setText(f"That doesn't look right: {e}.")
+            self.result_cmd = {"cmd": "join_invite", "code": self.j_code.text(), "name": name}
+        self.accept()
+
+
+class InviteDialog(QDialog):
+    def __init__(self, parent, code, network, hosting_info):
+        super().__init__(parent)
+        self.setWindowTitle("Invite friends")
+        self.setMinimumWidth(560)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(24, 20, 24, 18)
+        v.setSpacing(10)
+        t = QLabel(f"Invite friends to “{esc(network)}”")
+        t.setObjectName("dialogTitle")
+        v.addWidget(t)
+        how = QLabel("Send them this code. They open Rendezvous, click <b>Join a network</b> and paste it.")
+        how.setObjectName("muted")
+        how.setWordWrap(True)
+        v.addWidget(how)
+        box = QLineEdit(code)
+        box.setReadOnly(True)
+        box.setObjectName("invite")
+        box.setCursorPosition(0)
+        v.addWidget(box)
+        if hosting_info:
+            col = GREEN if hosting_info["reachable"] else AMBER
+            st = QLabel(("✓ " if hosting_info["reachable"] else "⚠ ") + esc(hosting_info["status"]))
+            st.setWordWrap(True)
+            st.setStyleSheet(f"border-left: 3px solid {col}; background: {rgba(col, 0.1)}; "
+                             f"padding: 8px 10px; border-radius: 6px;")
+            v.addWidget(st)
+        warn = QLabel("The code contains the network password: only send it to people you want in.")
+        warn.setObjectName("muted")
+        warn.setWordWrap(True)
+        v.addWidget(warn)
+        row = QHBoxLayout()
+        copy = QPushButton("Copy code")
+        copy.setObjectName("primary")
+        done = QLabel()
+        done.setObjectName("muted")
+
+        def do_copy():
+            QApplication.clipboard().setText(code)
+            done.setText("Copied ✓")
+        copy.clicked.connect(do_copy)
+        row.addWidget(copy)
+        row.addWidget(done)
+        row.addStretch(1)
+        close = QPushButton("Close")
+        close.setObjectName("small")
+        close.clicked.connect(self.accept)
+        row.addWidget(close)
+        v.addLayout(row)
 
 
 # ================================================================ main window
@@ -491,6 +655,7 @@ class MainWindow(QMainWindow):
         self.sel = None
         self.events = []
         self.join_prompted = False
+        self.invite_shown_for = None
         self.setWindowTitle("Rendezvous")
         self.resize(1440, 900)
 
@@ -517,10 +682,14 @@ class MainWindow(QMainWindow):
         self.target = QLabel()
         self.target.setObjectName("muted")
         head.addWidget(self.target)
-        self.join_btn = QPushButton("Join network…")
-        self.join_btn.setObjectName("plain")
-        self.join_btn.clicked.connect(self.open_join)
+        self.join_btn = QPushButton("Host or join\u2026")
+        self.join_btn.setObjectName("primary")
+        self.join_btn.clicked.connect(lambda: self.open_join())
         head.addWidget(self.join_btn)
+        self.invite_btn = QPushButton("Invite friends\u2026")
+        self.invite_btn.setObjectName("primary")
+        self.invite_btn.clicked.connect(self.open_invite)
+        head.addWidget(self.invite_btn)
         self.badge = QLabel("OFFLINE")
         self.badge.setObjectName("badge")
         head.addWidget(self.badge)
@@ -651,8 +820,10 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.status_s)
 
         menu = self.menuBar().addMenu("&Network")
-        act = QAction("&Join network…", self, shortcut=QKeySequence("Ctrl+J"), triggered=self.open_join)
-        menu.addAction(act)
+        menu.addAction(QAction("&Host a network\u2026", self, triggered=lambda: self.open_join("host")))
+        menu.addAction(QAction("&Join a network\u2026", self, shortcut=QKeySequence("Ctrl+J"),
+                               triggered=lambda: self.open_join("join")))
+        menu.addAction(QAction("&Invite friends\u2026", self, triggered=self.open_invite))
         menu.addAction(QAction("&Leave network", self, triggered=lambda: self.engine.command(cmd="leave")))
         menu.addSeparator()
         menu.addAction(QAction("Open &log folder", self, triggered=self.open_logs))
@@ -703,6 +874,9 @@ class MainWindow(QMainWindow):
             self.topo.pulse(m)
         elif t == "punch":
             self.topo.punch(m)
+        elif t == "join_failed":
+            QMessageBox.warning(self, "Couldn't join", f"The network refused to let you in: {m['reason']}.")
+            self.open_join("join")
         elif t == "fatal":
             QMessageBox.critical(self, "Rendezvous stopped", m["error"][-1500:])
 
@@ -727,8 +901,10 @@ class MainWindow(QMainWindow):
         me = s["me"]
         self.meta.setText(f"network <b style='color:{TEXT}'>{esc(s['network'])}</b> &nbsp;·&nbsp; you are "
                           f"<b style='color:{TEXT}'>{esc(me['name'])}</b>" if s["joined"] else "not connected")
-        self.join_btn.setVisible(not s["joined"])
+        self.join_btn.setVisible(not s["joined"] and not s["hosting_busy"])
+        self.invite_btn.setVisible(bool(s["joined"] and s["invite"]))
         self.leave_btn.setVisible(s["joined"])
+        self.leave_btn.setText("Stop hosting" if s["hosting"] else "Leave")
         self.copy_btn.setEnabled(bool(me["vip"]))
         for b in (self.b_relay, self.b_punch, self.b_drop):
             b.setEnabled(bool(peers))
@@ -742,8 +918,18 @@ class MainWindow(QMainWindow):
                  f"Virtual LAN unavailable: {v['detail']}" if v["status"] == "error" else v["detail"])
         self.vstatus.setText(vtext)
         self.vstatus.setStyleSheet(f"border-left: 3px solid {vcol}; background: {rgba(vcol, 0.1)};")
-        srv = s["server"] + (" ✓" if s["server_ok"] else " ✕" if s["server_ok"] is False else "")
-        self.kv.setText(f"Network: <b style='color:{TEXT}'>{esc(s['network'] or '-')}</b><br>"
+        srv = s["server"] + (" \u2713" if s["server_ok"] else " \u2715" if s["server_ok"] is False else "")
+        h = s["hosting"]
+        if s["hosting_busy"]:
+            role = f"<b style='color:{CYAN}'>Setting up hosting\u2026</b> asking the router to open the port"
+        elif h:
+            role = (f"<b style='color:{GREEN}'>HOSTING</b> \u00b7 reachable from the internet" if h["reachable"] else
+                    f"<b style='color:{AMBER}'>HOSTING</b> \u00b7 router port not open (see Invite friends)")
+        elif s["joined"]:
+            role = f"<b style='color:{TEXT}'>JOINED</b>"
+        else:
+            role = "not connected"
+        self.kv.setText(f"{role}<br>Network: <b style='color:{TEXT}'>{esc(s['network'] or '-')}</b><br>"
                         f"Public endpoint: <b style='color:{TEXT}'>{esc(me['public'])}</b><br>"
                         f"Rendezvous: <b style='color:{TEXT}'>{esc(srv)}</b>")
         self.status_v.setText(vtext)
@@ -751,8 +937,11 @@ class MainWindow(QMainWindow):
 
         self._render_table(peers)
         self._render_detail(sel, s)
+        if h and self.invite_shown_for != s["network"] and s["invite"]:
+            self.invite_shown_for = s["network"]  # just started hosting: show the code once
+            QTimer.singleShot(300, self.open_invite)
         if not s["joined"]:
-            self.hint.setText("Not connected. Use <b>Join network…</b> to join or create one.")
+            self.hint.setText("Not connected. Click <b>Host or join\u2026</b> to create a network or join a friend's.")
         elif v["status"] == "up":
             self.hint.setText("<b>To play:</b> host a LAN game on one PC; the others find it in their LAN list, "
                               "or connect to the host's <b>10.77.0.x</b> address.")
@@ -762,7 +951,7 @@ class MainWindow(QMainWindow):
 
         if first and not s["joined"] and not self.join_prompted:
             self.join_prompted = True
-            QTimer.singleShot(200, self.open_join)
+            QTimer.singleShot(200, lambda: self.open_join())
 
     def _render_table(self, peers):
         existing = {self.table.topLevelItem(i).data(0, Qt.UserRole): self.table.topLevelItem(i)
@@ -882,14 +1071,15 @@ class MainWindow(QMainWindow):
             self.chat_in.clear()
 
     # ------------------------------------------------------------ actions
-    def open_join(self):
+    def open_join(self, page="choose"):
         saved = (self.s or {}).get("saved", {})
-        d = JoinDialog(self, saved, (self.s or {}).get("me", {}).get("name"))
-        if d.exec() == QDialog.Accepted:
-            v = d.values()
-            if not v["password"] and saved.get("has_password") and v["network"] == saved.get("network"):
-                v["password"] = None  # keep the saved password
-            self.engine.command(cmd="join", **v)
+        d = StartDialog(self, saved, (self.s or {}).get("me", {}).get("name"), page)
+        if d.exec() == QDialog.Accepted and d.result_cmd:
+            self.engine.command(**d.result_cmd)
+
+    def open_invite(self):
+        if self.s and self.s.get("invite"):
+            InviteDialog(self, self.s["invite"], self.s["network"], self.s["hosting"]).exec()
 
     def copy_ip(self):
         if self.s and self.s["me"]["vip"]:
@@ -929,6 +1119,11 @@ QPushButton {{ border: 0; border-radius: 8px; padding: 8px 14px; font-weight: 70
 QPushButton#demo {{ color: {BG}; }}
 QPushButton#demo:disabled {{ background: {LINE}; color: {FAINT}; }}
 QPushButton#plain, QDialogButtonBox QPushButton {{ background: {TEXT}; color: {BG}; }}
+QPushButton#primary {{ background: {CYAN}; color: {BG}; padding: 9px 18px; }}
+QPushButton#choice {{ background: {CARD}; border: 1px solid {LINE}; border-radius: 12px; text-align: left;
+                      padding: 12px 16px; font-size: 15px; }}
+QPushButton#choice:hover {{ border-color: {CYAN}; background: #142131; }}
+QLineEdit#invite {{ font-family: Consolas, monospace; font-size: 15px; padding: 12px; color: {CYAN}; }}
 QPushButton#small {{ background: transparent; border: 1px solid {LINE}; color: {MUTED}; padding: 3px 10px; font-weight: 500; }}
 QPushButton#small:hover {{ color: {TEXT}; border-color: {FAINT}; }}
 QPushButton:hover {{ padding-top: 7px; padding-bottom: 9px; }}

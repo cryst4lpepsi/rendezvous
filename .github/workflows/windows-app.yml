@@ -71,14 +71,13 @@ jobs:
         shell: pwsh
         run: |
           Get-Process Rendezvous* -ErrorAction SilentlyContinue | Stop-Process -Force
-          $p = Start-Process python -ArgumentList "rendezvous_server.py","--port","9200","--http-port","0" -PassThru
-          Start-Sleep 1
+          # alice hosts in the exe (no separate server); bob joins her network
           $b = Start-Process python -ArgumentList "peer.py","--server","127.0.0.1:9200","--room","shot","--name","bob","--http-port","8281" -PassThru
-          dist/Rendezvous-console.exe --server 127.0.0.1:9200 --room shot --name alice --screenshot "$PWD/app-window.png:6" | Out-Host
-          Stop-Process -Id $p.Id, $b.Id -ErrorAction SilentlyContinue
+          dist/Rendezvous-console.exe --host --no-upnp --host-port 9200 --room shot --name alice --screenshot "$PWD/app-window.png:9" | Out-Host
+          Stop-Process -Id $b.Id -ErrorAction SilentlyContinue
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: app-window-screenshot
-          path: app-window.png
+          path: app-window*.png
