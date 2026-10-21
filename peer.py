@@ -550,11 +550,14 @@ class Peer:
             return fail("no host is online with that network name and code - check both, and that the "
                         "host has Rendezvous open")
         ep = hosts[-1]["ep"]  # the newest announcement
+        relay = hosts[-1].get("relay")
         mine = await self.stun_self()
         if not mine:
             return fail("couldn't reach a STUN server to learn this PC's public address")
-        self.event("info", f"host is at {ep[0]}:{ep[1]}; we are {mine[0]}:{mine[1]} - knocking and punching")
-        self.join(f"{ep[0]}:{ep[1]}", network, "", name, remember=False, room=room)
+        self.event("info", f"host is at {ep[0]}:{ep[1]}; we are {mine[0]}:{mine[1]} - knocking and punching"
+                           + (f" (relay {relay[0]}:{relay[1]} if punching fails)" if relay else ""))
+        self.join(f"{ep[0]}:{ep[1]}", network, "", name, remember=False, room=room,
+                  alt=f"{relay[0]}:{relay[1]}" if relay else None)
         self.code = code
         self.join_patience = 25.0  # punching through two NATs takes a few rounds
         asyncio.ensure_future(self._knock(mailbox, mine))
@@ -734,7 +737,8 @@ class Peer:
                 return
             self.joined_at = t
             self.local_addr = (guess_lan_ip(self.server_addr), self.udp_port)
-            self.event("warn", f"no answer from the public address, trying the host's LAN address {addr}")
+            self.event("warn", f"no answer from {self.server_candidates[self.server_index - 1]}, "
+                               f"trying {addr} instead")
             self._register()
         elif (not self.server_ever_ok and self.code and not self.hosting
               and self.server_index + 1 >= len(self.server_candidates) and t - self.joined_at > self.join_patience):

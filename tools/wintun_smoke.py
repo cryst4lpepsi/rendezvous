@@ -130,6 +130,36 @@ def main():
     reply = wait_for(lambda p: p[9] == 1 and p[16:20] == socket.inet_aton(REMOTE) and p[20] == 0)
     check("OS answers ping through the adapter", reply is not None)
 
+    # What a Minecraft client does to find "Open to LAN" worlds: listen on
+    # 4445 and join 224.0.2.60 WITHOUT naming a network card (Java's
+    # MulticastSocket default), so Windows picks one. The announcement must
+    # arrive when a remote player's packet is injected into our adapter.
+    def inbound(name, dst, port, sock_setup):
+        r = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        r.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        r.bind(("0.0.0.0", port))
+        sock_setup(r)
+        r.settimeout(3)
+        payload = f"[MOTD]{name}[/MOTD][AD]25565[/AD]".encode()
+        for _ in range(3):
+            a.write(udp(REMOTE, dst, 50000, port, payload))
+            try:
+                data, src = r.recvfrom(2048)
+                check(f"inbound {name} received by a plain listener", data == payload, f"from {src}")
+                break
+            except socket.timeout:
+                continue
+        else:
+            check(f"inbound {name} received by a plain listener", False, "(nothing arrived)")
+        r.close()
+
+    def join_default(r):
+        r.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                     socket.inet_aton("224.0.2.60") + socket.inet_aton("0.0.0.0"))
+    inbound("Minecraft LAN multicast 224.0.2.60:4445", "224.0.2.60", 4445, join_default)
+    inbound("broadcast 255.255.255.255", "255.255.255.255", 4447, lambda r: None)
+    inbound("subnet broadcast 10.77.0.255", "10.77.0.255", 4448, lambda r: None)
+
     a.close()
     print(f"{sum(results)}/{len(results)} checks passed")
     return 0 if all(results) else 1

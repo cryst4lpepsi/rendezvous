@@ -592,6 +592,138 @@ class Mailbox:
         threading.Thread(target=run, name="mailbox", daemon=True).start()
 
 
+# ============================================================ TURN relay (last resort)
+# If hole punching can't get through (a friend's connection changes ports for
+# every destination, typical of some mobile networks), the host also keeps an
+# address on a public TURN relay server (the standard internet relay, RFC 5766).
+# A friend who can't punch sends to that address instead; the relay forwards to
+# the host. Like Radmin's relays: slower than direct, but it always works.
+# Format: host:port:username:password[,more]
+STUN_MAGIC = rendezvous_server.STUN_MAGIC
+TURN_SERVERS = os.environ.get("RENDEZVOUS_TURN", "openrelay.metered.ca:80:openrelayproject:openrelayproject")
+
+
+def turn_servers():
+    out = []
+    for item in TURN_SERVERS.split(","):
+        parts = item.strip().split(":")
+        if len(parts) == 4 and parts[1].isdigit():
+            out.append((parts[0], int(parts[1]), parts[2], parts[3]))
+    return out
+
+
+def _attr(atype, value):
+    return struct.pack("!HH", atype, len(value)) + value + b"\0" * (-len(value) % 4)
+
+
+def _xor_addr(ip, port):
+    return struct.pack("!BBH", 0, 1, port ^ 0x2112) + bytes(a ^ b for a, b in zip(socket.inet_aton(ip), STUN_MAGIC))
+
+
+def _unxor_addr(value):
+    port = int.from_bytes(value[2:4], "big") ^ 0x2112
+    return socket.inet_ntoa(bytes(a ^ b for a, b in zip(value[4:8], STUN_MAGIC))), port
+
+
+def _attrs(msg):
+    out, pos, end = {}, 20, min(len(msg), 20 + int.from_bytes(msg[2:4], "big"))
+    while pos + 4 <= end:
+        atype, alen = struct.unpack("!HH", msg[pos:pos + 4])
+        out.setdefault(atype, msg[pos + 4:pos + 4 + alen])
+        pos += 4 + alen + (-alen % 4)
+    return out
+
+
+class TurnRelay:
+    """TURN client running on the host's server socket (requests and replies go
+    through RendezvousServer.transact, relayed packets through send_raw)."""
+
+    def __init__(self, server, host, port, user, password):
+        self.server = server
+        self.addr = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_DGRAM)[0][4][:2]
+        self.name = f"{host}:{port}"
+        self.user, self.password = user.encode(), password.encode()
+        self.realm = self.nonce = None
+        self.relayed = None
+        self.permitted = set()
+        self.lock = threading.Lock()
+
+    def _msg(self, mtype, attrs, auth):
+        tid = os.urandom(12)
+        body = b"".join(attrs)
+        if auth and self.realm is not None:
+            body += _attr(0x0006, self.user) + _attr(0x0014, self.realm) + _attr(0x0015, self.nonce)
+            key = hashlib.md5(self.user + b":" + self.realm + b":" + self.password).digest()
+            head = struct.pack("!HH", mtype, len(body) + 24) + STUN_MAGIC + tid
+            body += _attr(0x0008, hmac.new(key, head + body, hashlib.sha1).digest())  # MESSAGE-INTEGRITY
+        return struct.pack("!HH", mtype, len(body)) + STUN_MAGIC + tid + body
+
+    def _request(self, mtype, attrs):
+        with self.lock:
+            for _ in range(3):
+                resp = self.server.transact(self._msg(mtype, attrs, auth=True), self.addr, timeout=3)
+                if resp is None:
+                    raise PortMapError(f"no answer from the TURN relay {self.name}")
+                rtype, a = int.from_bytes(resp[0:2], "big"), _attrs(resp)
+                if rtype & 0x0110 == 0x0100:  # success response
+                    return a
+                err = a.get(0x0009, b"\0\0\0\0")
+                code = (err[2] & 7) * 100 + err[3]
+                if code in (401, 438) and 0x0015 in a:  # (stale) nonce: authenticate and retry
+                    self.realm, self.nonce = a.get(0x0014, self.realm), a[0x0015]
+                    continue
+                raise PortMapError(f"TURN relay refused: {code} {err[4:].decode(errors='replace')}".strip())
+            raise PortMapError("TURN relay authentication failed")
+
+    def allocate(self):
+        a = self._request(0x0003, [_attr(0x0019, b"\x11\0\0\0"),          # REQUESTED-TRANSPORT: UDP
+                                   _attr(0x000D, struct.pack("!I", 600))])  # LIFETIME
+        if 0x0016 not in a:
+            raise PortMapError("TURN relay gave no address")
+        self.relayed = _unxor_addr(a[0x0016])
+        return self.relayed
+
+    def permit(self, ip):
+        """Let this player's packets through the relay (permissions last 5 min)."""
+        self._request(0x0008, [_attr(0x0012, _xor_addr(ip, 0))])
+        self.permitted.add(ip)
+
+    def refresh(self):
+        self._request(0x0004, [_attr(0x000D, struct.pack("!I", 600))])
+        for ip in list(self.permitted):
+            self.permit(ip)
+
+    def wrap(self, data, peer):
+        """A packet for a relayed player -> TURN Send indication."""
+        return self._msg(0x0016, [_attr(0x0012, _xor_addr(*peer)), _attr(0x0013, data)], auth=False)
+
+    def unwrap(self, msg):
+        """TURN Data indication -> (player address, packet)."""
+        a = _attrs(msg)
+        if 0x0012 in a and 0x0013 in a:
+            return _unxor_addr(a[0x0012]), a[0x0013]
+        return None
+
+    def close(self):
+        try:
+            self._request(0x0004, [_attr(0x000D, struct.pack("!I", 0))])  # free the relay address
+        except (PortMapError, OSError):
+            pass
+
+
+def open_turn_relay(server):
+    """Try each configured TURN server; returns (TurnRelay or None, error)."""
+    errors = []
+    for host, port, user, password in turn_servers():
+        try:
+            relay = TurnRelay(server, host, port, user, password)
+            relay.allocate()
+            return relay, None
+        except (PortMapError, OSError) as e:
+            errors.append(f"{host}: {e}")
+    return None, "; ".join(errors) or "no TURN server configured"
+
+
 class PunchHost:
     """Keeps a CGNAT host reachable: announces its address in the mailbox and
     punches toward every friend who knocks."""
@@ -606,6 +738,8 @@ class PunchHost:
         self.symmetric = False
         self.error = None
         self.knocks = 0
+        self.relay = None        # TurnRelay, the last resort for friends who can't punch
+        self.relay_error = None
 
     def start(self):
         """Blocking. Returns True when the host is announced."""
@@ -619,6 +753,12 @@ class PunchHost:
         # "symmetric" NAT: punching will most likely fail.
         self.symmetric = len(eps) > 1 and eps[0][1] != eps[1][1]
         self.server.public_ip = self.endpoint[0]
+        self.relay, self.relay_error = open_turn_relay(self.server)
+        if self.relay:
+            self.server.turn = self.relay
+            log.info("TURN relay %s gave us %s:%s for friends who can't punch", self.relay.name, *self.relay.relayed)
+        else:
+            log.info("no TURN relay (%s): friends who can't punch won't get in", self.relay_error)
         try:
             self.announce()
         except OSError as e:
@@ -631,7 +771,8 @@ class PunchHost:
     def announce(self):
         lan = self.info["lan_ip"]
         self.mailbox.publish({"t": "host", "ep": list(self.endpoint),
-                              "lan": [lan, self.info["server"].port] if lan else None, "ts": int(time.time())})
+                              "lan": [lan, self.info["server"].port] if lan else None,
+                              "relay": list(self.relay.relayed) if self.relay else None, "ts": int(time.time())})
 
     def _on_message(self, obj):
         ep = obj.get("ep")
@@ -639,12 +780,27 @@ class PunchHost:
             self.knocks += 1
             log.info("knock from %s at %s:%s - punching toward it", obj.get("name"), ep[0], ep[1])
             self.server.punch_toward((str(ep[0]), int(ep[1])))
+            if self.relay and str(ep[0]) not in self.relay.permitted:
+                try:
+                    self.relay.permit(str(ep[0]))  # in case punching fails and they come via the relay
+                except (PortMapError, OSError) as e:
+                    log.info("TURN permission for %s failed: %s", ep[0], e)
 
     def _keepalive(self):
         """Keep the NAT mapping alive (they expire after ~30 s idle on many
         NATs) and re-announce if the public address changes."""
-        last_announce = time.time()
+        last_announce = last_relay = time.time()
         while not self.stop.wait(20):
+            if self.relay and time.time() - last_relay > 240:  # allocation 10 min, permissions 5 min
+                last_relay = time.time()
+                try:
+                    self.relay.refresh()
+                except (PortMapError, OSError) as e:
+                    log.info("TURN refresh failed (%s), allocating again", e)
+                    self.relay, self.relay_error = open_turn_relay(self.server)
+                    self.server.turn = self.relay
+                    self.server.turn_peers.clear()
+                    last_announce = 0  # announce the new relay address
             servers = stun_servers()
             ep = self.server.stun(servers[0]) if servers else None
             changed = bool(ep) and ep != self.endpoint
@@ -661,6 +817,9 @@ class PunchHost:
 
     def close(self):
         self.stop.set()
+        if self.relay:
+            self.relay.close()
+            self.server.turn = None
 
 
 def parse_any(network, text):
@@ -785,6 +944,8 @@ def map_ports(info):
             info["public_ip"] = ph.endpoint[0]
         info["status"] = (f"Online through hole punching ({why}). Friends connect straight to you; the free "
                           f"services STUN and ntfy.sh only help swap addresses."
+                          + (" If punching fails for a friend, they are relayed through a public TURN server."
+                             if ph.relay else "")
                           + (" Warning: your connection changes ports for every destination (symmetric NAT), "
                              "so punching will probably fail; if friends can't connect, let someone else host."
                              if ph.symmetric else ""))

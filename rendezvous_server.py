@@ -180,7 +180,9 @@ class RendezvousServer:
         self.only_room = None   # serve just this network
         self.public_ip = None   # the host's public IP, to describe peers that sit on the host's LAN
         self.overrides = {}     # port of a peer on this machine -> its port-forwarded (ip, port)
-        self._stun_waiting = {}  # transaction id -> [threading.Event, result]
+        self._stun_waiting = {}  # transaction id -> [threading.Event, raw response]
+        self.turn = None         # hosting.TurnRelay when a public relay is in use
+        self.turn_peers = set()  # players whose packets reach us through that relay
 
     # ------------------------------------------------------------------ io
     def send(self, msg, addr):
@@ -188,6 +190,8 @@ class RendezvousServer:
 
     def send_raw(self, data, addr):
         try:
+            if addr in self.turn_peers and self.turn:  # this player reaches us via the TURN relay
+                data, addr = self.turn.wrap(data, addr), self.turn.addr
             self.sock.sendto(data, addr)
         except OSError as e:
             log.debug("send to %s failed: %s", addr, e)
@@ -209,13 +213,21 @@ class RendezvousServer:
                 if not self.running:
                     break
                 raise
-            stun = parse_stun_response(data) if data[:1] == b"\x01" else None
-            if stun:
-                waiter = self._stun_waiting.get(stun[0])
-                if waiter:
-                    waiter[1] = stun[1]
-                    waiter[0].set()
-                continue
+            if len(data) >= 20 and data[0] < 2 and data[4:8] == STUN_MAGIC:  # STUN / TURN message
+                if data[0:2] == b"\x00\x17" and self.turn and addr == self.turn.addr:
+                    # TURN "Data indication": a player's packet that came in
+                    # through the relay; unwrap it and handle it like any other.
+                    unwrapped = self.turn.unwrap(data)
+                    if not unwrapped:
+                        continue
+                    addr, data = unwrapped
+                    self.turn_peers.add(addr)
+                else:
+                    waiter = self._stun_waiting.get(data[8:20])
+                    if waiter:
+                        waiter[1] = data
+                        waiter[0].set()
+                    continue
             with self.lock:
                 if data and data[0] == BIN_RELAY:
                     self.on_binary_relay(data, addr)
@@ -230,22 +242,30 @@ class RendezvousServer:
                     self.handle(msg, addr, len(data))
                 self.expire()
 
-    def stun(self, server_addr, timeout=2.0):
-        """Ask a STUN server, from this server's own socket, which public
-        address our packets come from. Called from another thread."""
-        import os
-        tid = os.urandom(12)
+    def transact(self, request, server_addr, timeout=2.0):
+        """Send a STUN/TURN request from this server's own socket and wait for
+        the response with the same transaction id (the receive loop hands it
+        over). Called from another thread. Returns the raw response or None."""
+        tid = request[8:20]
         waiter = self._stun_waiting[tid] = [threading.Event(), None]
         try:
             for wait in (timeout / 3, timeout * 2 / 3):  # one resend
-                self.sock.sendto(stun_request(tid), server_addr)
+                self.sock.sendto(request, server_addr)
                 if waiter[0].wait(wait):
                     return waiter[1]
         except OSError as e:
-            log.debug("STUN to %s failed: %s", server_addr, e)
+            log.debug("STUN/TURN request to %s failed: %s", server_addr, e)
         finally:
             self._stun_waiting.pop(tid, None)
         return None
+
+    def stun(self, server_addr, timeout=2.0):
+        """Ask a STUN server, from this server's own socket, which public
+        address our packets come from."""
+        import os
+        resp = self.transact(stun_request(os.urandom(12)), server_addr, timeout)
+        parsed = parse_stun_response(resp) if resp else None
+        return parsed[1] if parsed else None
 
     def punch_toward(self, addr, count=20, every=0.3):
         """Hole punching for a host behind CGNAT: a player who wants in told us
