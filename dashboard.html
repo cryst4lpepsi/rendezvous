@@ -1,0 +1,610 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rendezvous Peer</title>
+<style>
+  :root {
+    --bg: #0a0e14;
+    --card: #111821;
+    --card-2: #0d131b;
+    --line: #1e2936;
+    --text: #e6edf3;
+    --muted: #8b98a5;
+    --faint: #3a4756;
+    --green: #22c55e;
+    --amber: #f59e0b;
+    --cyan: #38bdf8;
+    --red: #f43f5e;
+    --slate: #94a3b8;
+    --state: var(--slate);
+    --mono: ui-monospace, "Cascadia Mono", Consolas, "SF Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body { display: flex; flex-direction: column; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 16px/1.4 system-ui, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  body[data-state=DISCOVERING]  { --state: var(--slate); }
+  body[data-state=PUNCHING]     { --state: var(--cyan); }
+  body[data-state=DIRECT]       { --state: var(--green); }
+  body[data-state=RELAY]        { --state: var(--amber); }
+  body[data-state=RECONNECTING] { --state: var(--red); }
+
+  /* ---------- header ---------- */
+  header {
+    display: flex; align-items: center; gap: 12px 20px; flex-wrap: wrap;
+    padding: 12px 24px; border-bottom: 1px solid var(--line); min-height: 72px;
+  }
+  .brand { font-weight: 800; letter-spacing: .14em; font-size: 20px; }
+  .brand small { display: block; font-weight: 500; letter-spacing: .02em; color: var(--muted); font-size: 13px; }
+  .meta { color: var(--muted); font-size: 15px; }
+  .meta b { color: var(--text); font-family: var(--mono); font-weight: 600; }
+  .spacer { flex: 1; }
+  .badge {
+    font-weight: 800; font-size: 26px; letter-spacing: .08em; padding: 6px 20px; border-radius: 999px;
+    color: var(--state); border: 2px solid var(--state);
+    background: color-mix(in srgb, var(--state) 14%, transparent);
+    transition: color .3s, border-color .3s, background .3s;
+  }
+  body[data-state=PUNCHING] .badge, body[data-state=RECONNECTING] .badge { animation: throb 1s ease-in-out infinite; }
+  @keyframes throb { 50% { box-shadow: 0 0 0 8px color-mix(in srgb, var(--state) 18%, transparent); } }
+  .live { font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  .live i { width: 10px; height: 10px; border-radius: 50%; background: var(--red); display: inline-block; }
+  .live.on i { background: var(--green); box-shadow: 0 0 8px var(--green); }
+
+  /* ---------- layout ---------- */
+  main {
+    display: grid; gap: 16px; padding: 16px 24px 20px;
+    grid-template-columns: minmax(0, 1.85fr) minmax(330px, 1fr);
+    grid-template-rows: minmax(0, 1.45fr) minmax(0, 1fr);
+    grid-template-areas: "stage stats" "log side";
+    flex: 1; min-height: 600px;
+  }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; min-height: 0; }
+  .card h2 {
+    margin: 0; font-size: 12px; letter-spacing: .16em; text-transform: uppercase; color: var(--muted); font-weight: 700;
+  }
+  .stage { grid-area: stage; position: relative; display: flex; flex-direction: column; overflow: hidden; }
+  .stats { grid-area: stats; padding: 16px; overflow: auto; display: flex; flex-direction: column; gap: 12px; }
+  .log { grid-area: log; display: flex; flex-direction: column; overflow: hidden; }
+  .chat { grid-area: side; }
+
+  /* ---------- stage ---------- */
+  #topo { flex: 1; width: 100%; min-height: 0; display: block; }
+  .caption {
+    padding: 0 24px 16px; display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  }
+  .caption .big { font-size: 26px; font-weight: 800; color: var(--state); letter-spacing: .02em; }
+  .caption .sub { font-size: 17px; color: var(--muted); flex: 1; min-width: 240px; }
+  .progress { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; width: 100%; display: none; }
+  .progress i { display: block; height: 100%; width: 0; background: var(--state); transition: width .25s linear; }
+  body[data-state=PUNCHING] .progress, body[data-state=RECONNECTING] .progress { display: block; }
+  .legend { position: absolute; top: 14px; left: 18px; display: flex; gap: 18px; font-size: 13px; color: var(--muted); flex-wrap: wrap; }
+  .legend span::before { content: ""; display: inline-block; width: 22px; height: 4px; border-radius: 2px; vertical-align: middle; margin-right: 6px; background: var(--c); }
+
+  .banner {
+    position: absolute; left: 50%; top: 52px; transform: translate(-50%, 0) scale(.9);
+    font-size: 34px; font-weight: 900; letter-spacing: .06em; padding: 14px 34px; border-radius: 16px;
+    background: var(--bg); border: 2px solid var(--bc, var(--state)); box-shadow: 0 10px 40px #000a;
+    color: var(--bc, var(--state)); opacity: 0; pointer-events: none; white-space: nowrap;
+    transition: opacity .25s, transform .25s;
+  }
+  .banner.show { opacity: 1; transform: translate(-50%, 0) scale(1); }
+
+  /* SVG */
+  .track { fill: none; stroke: var(--faint); stroke-width: 3; stroke-dasharray: 6 10; opacity: .55; transition: stroke .4s, opacity .4s; }
+  .glow { fill: none; stroke-width: 18; opacity: 0; stroke-linecap: round; transition: opacity .4s, stroke .4s; }
+  .flow { fill: none; stroke-width: 7; stroke-linecap: round; stroke-dasharray: 1 22; opacity: 0; transition: opacity .4s, stroke .4s; animation: march 0.9s linear infinite; }
+  .solid { fill: none; stroke-width: 5; opacity: 0; stroke-linecap: round; transition: opacity .4s, stroke .4s; }
+  @keyframes march { to { stroke-dashoffset: -23; } }
+  #direct .glow, #direct .flow, #direct .solid { stroke: var(--green); }
+  #relay  .glow, #relay  .flow, #relay  .solid { stroke: var(--amber); }
+
+  body[data-state=DIRECT] #direct :is(.glow) { opacity: .16; }
+  body[data-state=DIRECT] #direct :is(.flow, .solid) { opacity: 1; }
+  body[data-state=DIRECT] #direct .track { opacity: 0; }
+
+  body:is([data-state=RELAY], [data-state=RECONNECTING], [data-state=PUNCHING]) #relay .solid { opacity: .9; }
+  body:is([data-state=RELAY], [data-state=RECONNECTING], [data-state=PUNCHING]) #relay .flow { opacity: 1; }
+  body[data-state=RELAY] #relay .glow { opacity: .16; }
+  body:is([data-state=RECONNECTING], [data-state=PUNCHING]) #relay :is(.solid, .flow) { opacity: .45; }
+  body:is([data-state=RELAY], [data-state=RECONNECTING], [data-state=PUNCHING]) #relay .track { opacity: 0; }
+
+  body[data-state=PUNCHING] #direct .track { stroke: var(--cyan); opacity: 1; animation: blink .5s steps(2) infinite; }
+  body[data-state=RECONNECTING] #direct .track { stroke: var(--red); opacity: 1; stroke-width: 4; animation: blink .4s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: .25; } }
+
+  .node circle.ring { fill: var(--card-2); stroke: var(--state); stroke-width: 4; transition: stroke .4s; }
+  .node .name { font-size: 26px; font-weight: 800; fill: var(--text); text-anchor: middle; }
+  .node .role { font-size: 13px; letter-spacing: .18em; fill: var(--muted); text-anchor: middle; font-weight: 700; }
+  .node .addr { font-size: 16px; fill: var(--muted); text-anchor: middle; font-family: var(--mono); }
+  .node .icon { fill: none; stroke: var(--text); stroke-width: 3; stroke-linejoin: round; }
+  #peerNode.absent { opacity: .35; }
+  #peerNode.absent circle.ring { stroke: var(--slate); stroke-dasharray: 8 8; animation: spin 6s linear infinite; transform-origin: 850px 330px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #serverNode rect { fill: var(--card-2); stroke: var(--amber); stroke-width: 3; transition: stroke .4s; }
+  body:not([data-state=RELAY]):not([data-state=RECONNECTING]):not([data-state=PUNCHING]) #serverNode rect { stroke: var(--faint); }
+  #serverNode.down rect { stroke: var(--red); stroke-dasharray: 6 6; }
+  #serverNode .title { font-size: 15px; font-weight: 800; letter-spacing: .16em; fill: var(--text); text-anchor: middle; }
+  #serverNode .addr { font-size: 15px; fill: var(--muted); text-anchor: middle; font-family: var(--mono); }
+  #drop { opacity: 0; transition: opacity .3s; }
+  body.blackhole #drop { opacity: 1; }
+  #drop line { stroke: var(--red); stroke-width: 7; stroke-linecap: round; }
+  #drop text { fill: var(--red); font-size: 15px; font-weight: 800; letter-spacing: .14em; text-anchor: middle; }
+  .pkt { stroke: none; }
+  .pkt.direct { fill: var(--green); }
+  .pkt.relay { fill: var(--amber); }
+  .pkt.punch { fill: var(--cyan); }
+  .pkt.dead { fill: var(--red); }
+  .burst { fill: none; stroke-width: 3; }
+
+  /* ---------- stats ---------- */
+  .tiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+  .tile { background: var(--card-2); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; min-width: 0; }
+  .tile .k { font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); font-weight: 700; }
+  .tile .v { font-size: 24px; font-weight: 800; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tile .v small { font-size: 14px; color: var(--muted); font-weight: 600; }
+  .tile.wide { grid-column: 1 / -1; }
+  .rtt-row { display: flex; align-items: flex-end; gap: 14px; }
+  #rttVal { font-size: 42px; line-height: 1.05; flex: none; }
+  .path-direct { color: var(--green); }
+  .path-relay { color: var(--amber); }
+  #spark { flex: 1; min-width: 0; height: 52px; display: block; }
+  .meter { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; margin-top: 8px; }
+  .meter i { display: block; height: 100%; width: 0; background: var(--green); transition: width .25s linear, background .25s; }
+  .endpoints { font-family: var(--mono); font-size: 13.5px; display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; }
+  .endpoints span:nth-child(odd) { color: var(--muted); font-family: system-ui, "Segoe UI", sans-serif; }
+  .endpoints span:nth-child(even) { overflow-wrap: anywhere; }
+
+  /* ---------- log ---------- */
+  .card-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px 8px; gap: 12px; }
+  #events { list-style: none; margin: 0; padding: 0 8px 10px 16px; overflow-y: auto; flex: 1; font-size: 15px; }
+  #events li { display: grid; grid-template-columns: 112px 1fr; gap: 10px; padding: 3px 6px 3px 10px; border-left: 3px solid var(--faint); margin: 1px 0; }
+  #events li time { font-family: var(--mono); color: var(--muted); font-size: 13.5px; padding-top: 1px; }
+  #events li.good { border-color: var(--green); }
+  #events li.warn { border-color: var(--amber); }
+  #events li.bad { border-color: var(--red); }
+  #events li.transition { background: color-mix(in srgb, var(--lc, var(--slate)) 12%, transparent); font-weight: 700; }
+  #events li.transition.good { --lc: var(--green); } #events li.transition.warn { --lc: var(--amber); } #events li.transition.bad { --lc: var(--red); }
+  #events li.punch { color: var(--muted); }
+  .toggle { font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 6px; cursor: pointer; }
+
+  /* ---------- controls + chat ---------- */
+  .btns { display: flex; gap: 10px; flex-wrap: wrap; }
+  button {
+    font: inherit; font-weight: 800; font-size: 16px; color: var(--bg); border: 0; border-radius: 10px; padding: 11px 16px;
+    cursor: pointer; background: var(--bc); transition: transform .08s, filter .2s, opacity .2s; white-space: nowrap;
+  }
+  button:hover { filter: brightness(1.12); }
+  button:active { transform: scale(.97); }
+  button:disabled { opacity: .3; cursor: not-allowed; }
+  button kbd { font: 700 11px var(--mono); opacity: .65; border: 1px solid; border-radius: 4px; padding: 0 4px; margin-left: 4px; vertical-align: 2px; }
+  #bRelay { --bc: var(--amber); } #bPunch { --bc: var(--cyan); } #bDrop { --bc: var(--red); }
+  .flags { position: absolute; top: 12px; right: 16px; display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+  .flag { font-size: 12px; font-weight: 800; letter-spacing: .1em; padding: 4px 10px; border-radius: 999px; border: 1px solid; }
+  .flag.relay { color: var(--amber); } .flag.drop { color: var(--red); }
+
+  .chat { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  #msgs { flex: 1; overflow-y: auto; padding: 4px 16px; display: flex; flex-direction: column; gap: 8px; }
+  .msg { max-width: 85%; align-self: flex-start; background: var(--card-2); border: 1px solid var(--line); border-radius: 12px; padding: 7px 12px; }
+  .msg.mine { align-self: flex-end; border-color: color-mix(in srgb, var(--cyan) 35%, var(--line)); }
+  .msg .who { font-size: 12px; color: var(--muted); display: flex; gap: 8px; align-items: center; }
+  .msg .text { font-size: 18px; overflow-wrap: anywhere; }
+  .chip { font-size: 10.5px; font-weight: 800; letter-spacing: .1em; padding: 1px 7px; border-radius: 999px; border: 1px solid currentColor; }
+  .chip.direct { color: var(--green); } .chip.relay { color: var(--amber); }
+  .empty { color: var(--faint); font-size: 14px; margin: auto; text-align: center; }
+  form { display: flex; gap: 8px; padding: 10px 12px 12px; }
+  input {
+    flex: 1; min-width: 0; font: inherit; font-size: 17px; color: var(--text); background: var(--card-2);
+    border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
+  }
+  input:focus { outline: 2px solid color-mix(in srgb, var(--cyan) 60%, transparent); border-color: transparent; }
+  form button { --bc: var(--text); padding: 10px 18px; }
+
+  @media (max-width: 1400px) {
+    .brand small, button kbd { display: none; }
+    .live span { display: none; }
+  }
+  /* ---------- narrow screens ---------- */
+  @media (max-width: 1050px) {
+    main { grid-template-columns: minmax(0, 1fr); grid-template-rows: none; grid-template-areas: "stage" "stats" "side" "log"; height: auto; padding: 12px 16px; }
+    .legend { position: static; padding: 12px 16px 0; gap: 4px 14px; }
+    .flags { top: auto; bottom: 10px; }
+    .btns { width: 100%; } .btns button { flex: 1; padding: 10px 6px; font-size: 14px; }
+    .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .stage { min-height: 380px; }
+    .log { height: 420px; } .chat { height: 360px; }
+    header { padding: 10px 16px; gap: 12px; }
+    .badge { font-size: 20px; }
+    .banner { font-size: 20px; top: 8px; }
+    body { display: block; height: auto; }
+  }
+</style>
+</head>
+<body data-state="DISCOVERING">
+<header>
+  <div class="brand">RENDEZVOUS<small>userspace NAT traversal · live path view</small></div>
+  <div class="meta">room <b id="room">-</b> &nbsp;·&nbsp; you are <b id="hdrName">-</b></div>
+  <div class="spacer"></div>
+  <div class="btns">
+    <button id="bRelay" data-cmd="force_relay" title="pin traffic to the relay on both peers">Force Relay <kbd>R</kbd></button>
+    <button id="bPunch" data-cmd="repunch" title="clear overrides and hole-punch again">Force Re-punch <kbd>P</kbd></button>
+    <button id="bDrop" data-cmd="drop_direct" title="silently discard all direct packets; the keepalive watchdog must notice">Drop Direct Path <kbd>D</kbd></button>
+  </div>
+  <div class="live" id="live"><i></i><span>connecting…</span></div>
+  <div class="badge" id="badge">DISCOVERING</div>
+</header>
+
+<main>
+  <section class="card stage">
+    <div class="legend">
+      <span style="--c: var(--green)">direct (peer ↔ peer)</span>
+      <span style="--c: var(--amber)">relay (via server)</span>
+      <span style="--c: var(--cyan)">punch / keepalive packets</span>
+    </div>
+    <svg id="topo" viewBox="0 0 1000 470" preserveAspectRatio="xMidYMid meet" aria-label="connection topology">
+      <!-- relay route: bent up through the server -->
+      <g id="relay">
+        <path class="track" d="M150,330 C230,170 370,110 500,110 C630,110 770,170 850,330"/>
+        <path class="glow"  d="M150,330 C230,170 370,110 500,110 C630,110 770,170 850,330"/>
+        <path class="solid" d="M150,330 C230,170 370,110 500,110 C630,110 770,170 850,330"/>
+        <path class="flow" id="p-relay" d="M150,330 C230,170 370,110 500,110 C630,110 770,170 850,330"/>
+      </g>
+      <!-- direct route: straight between the peers -->
+      <g id="direct">
+        <path class="track" d="M150,330 L850,330"/>
+        <path class="glow"  d="M150,330 L850,330"/>
+        <path class="solid" d="M150,330 L850,330"/>
+        <path class="flow" id="p-direct" d="M150,330 L850,330"/>
+      </g>
+      <g id="drop">
+        <line x1="482" y1="312" x2="518" y2="348"/><line x1="518" y1="312" x2="482" y2="348"/>
+        <text x="500" y="380">DROPPED</text>
+      </g>
+      <g id="pkts"></g>
+
+      <g id="serverNode">
+        <rect x="370" y="72" width="260" height="76" rx="16"/>
+        <text class="title" x="500" y="104">RENDEZVOUS · RELAY</text>
+        <text class="addr" id="srvAddr" x="500" y="130">-</text>
+      </g>
+      <g class="node" id="meNode">
+        <circle class="ring" cx="150" cy="330" r="60"/>
+        <g class="icon" transform="translate(150 330)"><rect x="-24" y="-20" width="48" height="31" rx="3"/><path d="M-32,18 H32 L26,11 H-26 Z"/></g>
+        <text class="role" x="150" y="252">YOU</text>
+        <text class="name" id="meName" x="150" y="425">-</text>
+        <text class="addr" id="meAddr" x="150" y="452">-</text>
+      </g>
+      <g class="node absent" id="peerNode">
+        <circle class="ring" cx="850" cy="330" r="60"/>
+        <g class="icon" transform="translate(850 330)"><rect x="-24" y="-20" width="48" height="31" rx="3"/><path d="M-32,18 H32 L26,11 H-26 Z"/></g>
+        <text class="role" x="850" y="252">PEER</text>
+        <text class="name" id="peerName" x="850" y="425">waiting…</text>
+        <text class="addr" id="peerAddr" x="850" y="452">-</text>
+      </g>
+    </svg>
+    <div class="caption">
+      <div class="big" id="capBig">DISCOVERING</div>
+      <div class="sub" id="capSub">Contacting rendezvous server…</div>
+      <div class="progress"><i id="punchBar"></i></div>
+    </div>
+    <div class="flags" id="flags"></div>
+    <div class="banner" id="banner"></div>
+  </section>
+
+  <aside class="card stats">
+    <div class="tiles">
+      <div class="tile wide">
+        <div class="k">Round-trip time <span id="rttPathLbl"></span></div>
+        <div class="rtt-row"><div class="v" id="rttVal">–</div><canvas id="spark"></canvas></div>
+      </div>
+      <div class="tile"><div class="k">Path</div><div class="v" id="pathVal">none</div></div>
+      <div class="tile"><div class="k">In state</div><div class="v" id="sinceVal">0s</div></div>
+      <div class="tile"><div class="k">Punches</div><div class="v" id="punchVal">0</div></div>
+      <div class="tile"><div class="k">Bytes out</div><div class="v" id="txVal">0 B</div></div>
+      <div class="tile"><div class="k">Bytes in</div><div class="v" id="rxVal">0 B</div></div>
+      <div class="tile"><div class="k">Pkts out / in</div><div class="v" id="pktVal">0 / 0</div></div>
+      <div class="tile wide">
+        <div class="k">Direct keepalive · last packet <span id="silenceLbl">–</span></div>
+        <div class="meter"><i id="silenceBar"></i></div>
+      </div>
+    </div>
+    <h2>Endpoints</h2>
+    <div class="endpoints">
+      <span>You (public)</span><span id="eMePub">-</span>
+      <span>You (local)</span><span id="eMeLoc">-</span>
+      <span>Peer (public)</span><span id="ePeerPub">-</span>
+      <span>Peer (local)</span><span id="ePeerLoc">-</span>
+      <span>Direct locked to</span><span id="eDirect">-</span>
+      <span>Rendezvous</span><span id="eSrv">-</span>
+    </div>
+  </aside>
+
+  <section class="card log">
+    <div class="card-head">
+      <h2>Event log</h2>
+      <label class="toggle"><input type="checkbox" id="showPunch" checked style="flex:none;width:auto"> show punch attempts</label>
+    </div>
+    <ul id="events"></ul>
+  </section>
+
+  <section class="card chat">
+      <div class="card-head"><h2>Tunnel chat</h2><span class="toggle">each message shows the path it took</span></div>
+      <div id="msgs"><div class="empty" id="chatEmpty">Messages typed here travel through the tunnel on the active path.</div></div>
+      <form id="chatForm" autocomplete="off">
+        <input id="chatIn" placeholder="Type a message…" maxlength="2000">
+        <button type="submit">Send</button>
+      </form>
+  </section>
+</main>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const NS = "http://www.w3.org/2000/svg";
+  let S = null, ws = null, prevState = null;
+  const seenEvents = new Set();
+
+  const CAPTIONS = {
+    DISCOVERING: (s) => s.me.public === "-" ? "Contacting rendezvous server…"
+      : s.server_ok === false ? "Rendezvous server unreachable — retrying registration"
+      : `Registered as ${s.me.public}. Waiting for a peer to join room “${s.room}”.`,
+    PUNCHING: (s) => `Both peers fire UDP packets at each other's public endpoint to open their NATs. Traffic uses the relay meanwhile.`,
+    DIRECT: (s) => `Peer-to-peer through the punched hole. The server is no longer in the data path.`,
+    RELAY: (s) => s.forced_relay ? `Relay pinned by operator. The server forwards every packet between the peers.`
+      : `Hole punching failed. The server forwards every packet between the peers${s.blackhole ? " (direct path is being dropped)" : ""}.`,
+    RECONNECTING: (s) => `Direct path went silent. Traffic moved to the relay while re-punching.`,
+  };
+  const COLORS = { DISCOVERING: "--slate", PUNCHING: "--cyan", DIRECT: "--green", RELAY: "--amber", RECONNECTING: "--red" };
+
+  function bytes(n) {
+    n = n || 0;
+    if (n < 1024) return n + " B";
+    if (n < 1048576) return (n / 1024).toFixed(1) + " KB";
+    return (n / 1048576).toFixed(2) + " MB";
+  }
+  const hms = (ts) => { const d = new Date(ts * 1000); return d.toTimeString().slice(0, 8) + "." + String(d.getMilliseconds()).padStart(3, "0"); };
+  const esc = (t) => t.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+  // ---------------------------------------------------------------- render
+  function render(s) {
+    S = s;
+    document.body.dataset.state = s.state;
+    document.body.classList.toggle("blackhole", !!s.blackhole);
+    $("badge").textContent = s.state;
+    $("room").textContent = s.room;
+    $("hdrName").textContent = s.me.name;
+    document.title = `${s.state} · ${s.me.name}`;
+
+    $("meName").textContent = s.me.name;
+    $("meAddr").textContent = s.me.public !== "-" ? s.me.public : s.me.local;
+    $("srvAddr").textContent = s.server + (s.server_ok === false ? "  ✕ unreachable" : "");
+    $("serverNode").classList.toggle("down", s.server_ok === false);
+    const p = s.peer;
+    $("peerNode").classList.toggle("absent", !p);
+    $("peerName").textContent = p ? p.name : "waiting…";
+    $("peerAddr").textContent = p ? (s.state === "DIRECT" && s.direct_addr !== "-" ? s.direct_addr : p.public) : "";
+
+    $("capBig").textContent = s.state === "DIRECT" ? "DIRECT" : s.state === "RELAY" ? "RELAY" : s.state;
+    $("capSub").textContent = CAPTIONS[s.state](s);
+    if (s.punch.elapsed != null) $("punchBar").style.width = Math.min(100, 100 * s.punch.elapsed / s.punch.timeout) + "%";
+
+    // stats
+    const pathCls = s.path ? "path-" + s.path : "";
+    $("rttVal").className = "v " + (s.rtt_path ? "path-" + s.rtt_path : "");
+    $("rttVal").innerHTML = s.rtt_ms != null ? `${s.rtt_ms.toFixed(s.rtt_ms < 10 ? 2 : 1)} <small>ms</small>` : "–";
+    $("rttPathLbl").textContent = s.rtt_path ? `· via ${s.rtt_path}` : "";
+    $("pathVal").className = "v " + pathCls;
+    $("pathVal").textContent = s.path ? s.path.toUpperCase() : "none";
+    $("sinceVal").textContent = s.in_state_s < 60 ? s.in_state_s.toFixed(0) + "s" : Math.floor(s.in_state_s / 60) + "m " + Math.floor(s.in_state_s % 60) + "s";
+    const st = s.stats || {};
+    $("txVal").textContent = bytes(st.tx_bytes);
+    $("rxVal").textContent = bytes(st.rx_bytes);
+    $("txVal").title = `direct ${bytes(st.tx_direct_bytes)} · relay ${bytes(st.tx_relay_bytes)}`;
+    $("rxVal").title = `direct ${bytes(st.rx_direct_bytes)} · relay ${bytes(st.rx_relay_bytes)}`;
+    $("pktVal").textContent = `${st.tx_packets || 0} / ${st.rx_packets || 0}`;
+    $("punchVal").innerHTML = (s.state === "PUNCHING" || s.state === "RECONNECTING")
+      ? `${s.punch.round} <small>/ ${s.punch.total}</small>`
+      : `${s.punch.total}`;
+    $("punchVal").title = "this round / total punch attempts";
+
+    const sil = s.direct_silence_s;
+    const watching = s.peer && (s.state === "DIRECT" || s.state === "RECONNECTING");
+    $("silenceLbl").textContent = watching && sil != null ? `${sil.toFixed(1)}s ago (dead after ${s.dead_after}s)` : "– (not on direct path)";
+    const frac = watching && sil != null ? Math.min(1, sil / s.dead_after) : 0;
+    $("silenceBar").style.width = (frac * 100) + "%";
+    $("silenceBar").style.background = frac > .7 ? "var(--red)" : frac > .4 ? "var(--amber)" : "var(--green)";
+
+    $("eMePub").textContent = s.me.public;
+    $("eMeLoc").textContent = s.me.local;
+    $("ePeerPub").textContent = p ? p.public : "-";
+    $("ePeerLoc").textContent = p ? p.local : "-";
+    $("eDirect").textContent = s.state === "DIRECT" ? s.direct_addr : "-";
+    $("eSrv").textContent = s.server + (s.server_ok ? "  ✓" : s.server_ok === false ? "  ✕" : "");
+
+    // controls
+    for (const b of document.querySelectorAll(".btns button")) b.disabled = !p;
+    const flags = [];
+    if (s.forced_relay) flags.push('<span class="flag relay">RELAY FORCED</span>');
+    if (s.blackhole) flags.push('<span class="flag drop">DIRECT PATH DROPPED</span>');
+    $("flags").innerHTML = flags.join("");
+
+    drawSpark(s.rtt_history || []);
+    prevState = s.state;
+  }
+
+  // RTT sparkline, coloured by the path each sample travelled.
+  function drawSpark(hist) {
+    const c = $("spark"), dpr = window.devicePixelRatio || 1;
+    const w = c.clientWidth, h = c.clientHeight;
+    if (c.width !== w * dpr) { c.width = w * dpr; c.height = h * dpr; }
+    const g = c.getContext("2d");
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, w, h);
+    if (hist.length < 2) return;
+    const css = getComputedStyle(document.documentElement);
+    const col = { direct: css.getPropertyValue("--green"), relay: css.getPropertyValue("--amber") };
+    const max = Math.max(1, ...hist.map((x) => x[1])) * 1.15;
+    const n = 60, step = w / (n - 1), off = n - hist.length;
+    const X = (i) => (i + off) * step, Y = (v) => h - 16 - (v / max) * (h - 20);
+    g.lineWidth = 2.5; g.lineJoin = "round"; g.lineCap = "round";
+    for (let i = 1; i < hist.length; i++) {
+      g.strokeStyle = col[hist[i][2]] || "#888";
+      g.beginPath(); g.moveTo(X(i - 1), Y(hist[i - 1][1])); g.lineTo(X(i), Y(hist[i][1])); g.stroke();
+    }
+    g.fillStyle = css.getPropertyValue("--muted"); g.font = "11px system-ui"; g.textAlign = "right";
+    g.fillText(`peak ${(max / 1.15).toFixed(2)} ms`, w - 2, h - 1);
+  }
+
+  // ------------------------------------------------------------ animations
+  function animate(pathEl, from, to, dur, cls, r, onEnd) {
+    const len = pathEl.getTotalLength();
+    const c = document.createElementNS(NS, "circle");
+    c.setAttribute("r", r); c.setAttribute("class", "pkt " + cls);
+    $("pkts").appendChild(c);
+    const t0 = performance.now();
+    (function step(t) {
+      const k = Math.min(1, (t - t0) / dur);
+      const e = k < .5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2;
+      const pt = pathEl.getPointAtLength((from + (to - from) * e) * len);
+      c.setAttribute("cx", pt.x); c.setAttribute("cy", pt.y);
+      c.setAttribute("opacity", k > .85 ? (1 - k) / .15 : 1);
+      if (k < 1) requestAnimationFrame(step); else { c.remove(); onEnd && onEnd(pt); }
+    })(t0);
+  }
+  function burst(x, y, color, r0 = 6, r1 = 30, dur = 500) {
+    const c = document.createElementNS(NS, "circle");
+    c.setAttribute("cx", x); c.setAttribute("cy", y); c.setAttribute("class", "burst"); c.style.stroke = color;
+    $("pkts").appendChild(c);
+    const t0 = performance.now();
+    (function step(t) {
+      const k = Math.min(1, (t - t0) / dur);
+      c.setAttribute("r", r0 + (r1 - r0) * k); c.setAttribute("opacity", 1 - k);
+      if (k < 1) requestAnimationFrame(step); else c.remove();
+    })(t0);
+  }
+  const DROP_AT = 0.5;  // the X marker sits in the middle of the direct line
+  function pulse(m) {
+    if (!S || !m.path || document.hidden) return;
+    const el = $("p-" + m.path);
+    const dur = m.path === "direct" ? 650 : 1000;
+    const r = m.big ? 12 : 7;
+    if (m.path === "direct" && S.blackhole) {
+      const [a, b] = m.dir === "out" ? [0, DROP_AT] : [1, DROP_AT];
+      animate(el, a, b, dur / 2, "dead", r, (pt) => burst(pt.x, pt.y, "var(--red)"));
+      return;
+    }
+    animate(el, m.dir === "out" ? 0 : 1, m.dir === "out" ? 1 : 0, dur, m.path, r);
+  }
+  function punch() {
+    if (document.hidden) return;
+    const el = $("p-direct");
+    const color = S && S.state === "RECONNECTING" ? "var(--red)" : "var(--cyan)";
+    animate(el, 0, S && S.blackhole ? DROP_AT : 0.42, 420, S && S.blackhole ? "dead" : "punch", 7,
+            (pt) => burst(pt.x, pt.y, color, 4, 22, 400));
+  }
+  let bannerTimer = null;
+  function transition(m) {
+    const b = $("banner");
+    b.style.setProperty("--bc", `var(${COLORS[m.to]})`);
+    b.textContent = `${m.from} → ${m.to}`;
+    b.classList.add("show");
+    clearTimeout(bannerTimer);
+    bannerTimer = setTimeout(() => b.classList.remove("show"), 2200);
+    if (m.to === "DIRECT") { burst(150, 330, "var(--green)", 60, 110, 800); burst(850, 330, "var(--green)", 60, 110, 800); }
+    if (m.to === "RELAY") burst(500, 110, "var(--amber)", 40, 140, 800);
+    if (m.to === "RECONNECTING") burst(500, 330, "var(--red)", 10, 90, 700);
+  }
+
+  // ------------------------------------------------------------ event log
+  function addEvent(ev) {
+    if (seenEvents.has(ev.id)) return;
+    seenEvents.add(ev.id);
+    const ul = $("events");
+    const li = document.createElement("li");
+    const isTrans = /^[A-Z]+ -> [A-Z]+:/.test(ev.msg);
+    const isPunch = /^punch attempt/.test(ev.msg);
+    li.className = ev.level + (isTrans ? " transition" : "") + (isPunch ? " punch" : "");
+    if (isPunch && !$("showPunch").checked) li.hidden = true;
+    li.innerHTML = `<time>${hms(ev.ts)}</time><span>${esc(ev.msg).replace(/ -&gt; /g, " → ")}</span>`;
+    ul.appendChild(li);
+    while (ul.children.length > 400) ul.firstChild.remove();
+    if (stickLog) ul.scrollTop = ul.scrollHeight;
+  }
+  // Follow the newest event unless the user scrolled up to read history.
+  let stickLog = true;
+  $("events").addEventListener("scroll", (e) => {
+    const ul = e.target; stickLog = ul.scrollHeight - ul.scrollTop - ul.clientHeight < 40;
+  });
+  new ResizeObserver(() => { if (stickLog) $("events").scrollTop = $("events").scrollHeight; }).observe($("events"));
+  $("showPunch").addEventListener("change", (e) => {
+    for (const li of document.querySelectorAll("#events li.punch")) li.hidden = !e.target.checked;
+    $("events").scrollTop = $("events").scrollHeight;
+  });
+
+  // ----------------------------------------------------------------- chat
+  function addChat(m) {
+    $("chatEmpty")?.remove();
+    const box = $("msgs");
+    const d = document.createElement("div");
+    d.className = "msg" + (m.mine ? " mine" : "");
+    const chip = m.path ? `<span class="chip ${m.path}">${m.path.toUpperCase()}</span>` : "";
+    d.innerHTML = `<div class="who">${esc(m.who)} · ${hms(m.ts).slice(0, 8)} ${chip}</div><div class="text">${esc(m.text)}</div>`;
+    box.appendChild(d);
+    box.scrollTop = box.scrollHeight;
+  }
+  $("chatForm").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const t = $("chatIn").value.trim();
+    if (t && send({ cmd: "chat", text: t })) $("chatIn").value = "";
+  });
+
+  // ------------------------------------------------------------- controls
+  function send(obj) {
+    if (!ws || ws.readyState !== 1) return false;
+    ws.send(JSON.stringify(obj));
+    return true;
+  }
+  for (const b of document.querySelectorAll(".btns button")) b.addEventListener("click", () => send({ cmd: b.dataset.cmd }));
+  document.addEventListener("keydown", (e) => {
+    if (e.target.tagName === "INPUT" || e.ctrlKey || e.metaKey || e.altKey) return;
+    const k = { r: "bRelay", p: "bPunch", d: "bDrop" }[e.key.toLowerCase()];
+    if (k && !$(k).disabled) { $(k).click(); $(k).focus(); }
+  });
+
+  // ------------------------------------------------------------ websocket
+  function connect() {
+    ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
+    ws.onopen = () => { $("live").classList.add("on"); $("live").querySelector("span").textContent = "live"; };
+    ws.onclose = () => {
+      $("live").classList.remove("on"); $("live").querySelector("span").textContent = "peer process offline — retrying";
+      setTimeout(connect, 1000);
+    };
+    ws.onmessage = (e) => {
+      const m = JSON.parse(e.data);
+      switch (m.type) {
+        case "hello":
+          $("events").innerHTML = ""; seenEvents.clear();
+          m.events.forEach(addEvent);
+          $("msgs").innerHTML = ""; m.chat.forEach(addChat);
+          if (!m.chat.length) $("msgs").innerHTML = '<div class="empty" id="chatEmpty">Messages typed here travel through the tunnel on the active path.</div>';
+          break;
+        case "state": render(m); break;
+        case "event": addEvent(m); break;
+        case "chat": addChat(m); break;
+        case "transition": transition(m); break;
+        case "pulse": pulse(m); break;
+        case "punch": punch(); break;
+      }
+    };
+  }
+  window.addEventListener("resize", () => S && drawSpark(S.rtt_history || []));
+  connect();
+})();
+</script>
+</body>
+</html>
