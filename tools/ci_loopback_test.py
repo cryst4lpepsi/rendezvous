@@ -99,7 +99,11 @@ def main():
             print(f"[FAIL] built exe serves the dashboard: {e}")
 
     for p in procs:
-        p.terminate()
+        if sys.platform == "win32":
+            # A one-file exe is a launcher plus a child process: kill the whole tree.
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], capture_output=True)
+        else:
+            p.terminate()
     time.sleep(1)
     print(f"{sum(ok)}/{len(ok)} checks passed")
     if not all(ok):

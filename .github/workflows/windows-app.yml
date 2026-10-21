@@ -70,6 +70,7 @@ jobs:
         if: always()
         shell: pwsh
         run: |
+          Get-Process Rendezvous* -ErrorAction SilentlyContinue | Stop-Process -Force
           $p = Start-Process python -ArgumentList "rendezvous_server.py","--port","9200","--http-port","0" -PassThru
           Start-Sleep 1
           $b = Start-Process python -ArgumentList "peer.py","--server","127.0.0.1:9200","--room","shot","--name","bob","--http-port","8281" -PassThru
