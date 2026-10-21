@@ -85,10 +85,14 @@ def main():
     # Host mode, no separate server: one peer hosts, another joins with network name + code.
     start([PY, "peer.py", "--host", "--no-upnp", "--host-port", "9300", "--room", "Host CI",
            "--name", "hoster", "--http-port", "8380"], "ci-hoster.log")
-    ok.append(wait(lambda: bool(api(8380)["code"]), 20, "host mode: hoster gets a 10-digit code"))
+    ok.append(wait(lambda: bool(api(8380)["code"]), 20, "host mode: hoster gets a code"))
     code = api(8380)["code"]
-    print(f"       code: {api(8380)['code_display']}", flush=True)
-    ok.append(len(code.split(":")[0]) == 10 and code.split(":")[0].isdigit())
+    digits = code.split(":")[0]
+    mode = api(8380)["hosting"]["mode"]
+    # UPnP is off here, so the host falls back to hole punching (6 digits) when
+    # STUN + ntfy.sh are reachable, else to a home-network code (10 digits).
+    ok.append(digits.isdigit() and len(digits) == (6 if mode == "punch" else 10))
+    print(f"[{'PASS' if ok[-1] else 'FAIL'}] host mode: {mode} -> code {api(8380)['code_display']}", flush=True)
     start([PY, "peer.py", "--room", "host ci", "--code", code, "--name", "joiner", "--http-port", "8381"],
           "ci-joiner.log")
     ok.append(wait(lambda: states(8381) == ["DIRECT"] and states(8380) == ["DIRECT"], 20,
@@ -105,7 +109,12 @@ def main():
     try:
         box = hosting.Mailbox(f"ci-{time.time()}", hosting.new_short_code())
         box.publish({"t": "host", "ep": ["192.0.2.1", 9000], "ts": int(time.time())})
-        got = box.fetch()
+        got = []
+        for _ in range(6):  # the service lists a new message after a moment
+            time.sleep(1)
+            got = box.fetch()
+            if got:
+                break
         good = any(m.get("t") == "host" for m in got)
         print(f"[{'PASS' if good else 'WARN'}] real mailbox ({hosting.MAILBOX_URL}): published and read back "
               f"an encrypted message ({len(got)} found)", flush=True)
