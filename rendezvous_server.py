@@ -49,15 +49,41 @@ MAX_PEERS_PER_ROOM = 2  # this tool is strictly point-to-point
 MAX_DATAGRAM = 65535
 
 
+def disable_udp_connreset(sock):
+    """
+    Windows quirk: if we send to a port that answers with ICMP "port
+    unreachable" (a peer that just exited, a punch at a port that isn't open
+    yet), the NEXT recvfrom() on this socket fails with WSAECONNRESET.
+    Turning off SIO_UDP_CONNRESET makes UDP behave like it does on Linux/macOS.
+
+    Python's socket.ioctl() only accepts a few control codes and this isn't
+    one of them, so we call WSAIoctl from ws2_32.dll directly.
+    """
+    if sys.platform != "win32":
+        return
+    import ctypes
+    from ctypes import wintypes
+    SIO_UDP_CONNRESET = 0x9800000C  # _WSAIOW(IOC_VENDOR, 12)
+    try:
+        ws2 = ctypes.WinDLL("ws2_32")
+        ws2.WSAIoctl.argtypes = [ctypes.c_size_t, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                                 ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+                                 ctypes.c_void_p, ctypes.c_void_p]
+        ws2.WSAIoctl.restype = ctypes.c_int
+        flag = wintypes.BOOL(False)
+        returned = wintypes.DWORD(0)
+        if ws2.WSAIoctl(sock.fileno(), SIO_UDP_CONNRESET, ctypes.byref(flag), ctypes.sizeof(flag),
+                        None, 0, ctypes.byref(returned), None, None) != 0:
+            raise OSError(ws2.WSAGetLastError(), "WSAIoctl(SIO_UDP_CONNRESET) failed")
+    except (OSError, AttributeError) as e:
+        # Not fatal: the receive loops also tolerate ConnectionResetError.
+        log.warning("could not disable UDP connection-reset errors: %s", e)
+
+
 def make_udp_socket(host, port):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    if sys.platform == "win32":
-        # Windows quirk: if we send to a port that answers with ICMP "port
-        # unreachable" (e.g. a peer that just exited), the NEXT recvfrom() on
-        # this socket raises ConnectionResetError (WSAECONNRESET). Turning off
-        # SIO_UDP_CONNRESET makes UDP behave like it does on Linux/macOS.
-        sock.ioctl(socket.SIO_UDP_CONNRESET, False)
+    disable_udp_connreset(sock)
     sock.bind((host, port))
     return sock
 

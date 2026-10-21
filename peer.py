@@ -39,6 +39,8 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from rendezvous_server import disable_udp_connreset
+
 log = logging.getLogger("peer")
 
 DISCOVERING = "DISCOVERING"
@@ -63,11 +65,9 @@ def now():
 
 def make_udp_socket(host, port):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    if sys.platform == "win32":
-        # Without this, an ICMP "port unreachable" (common while punching at a
-        # port that isn't open yet) makes Windows fail the next recv with
-        # WSAECONNRESET. See rendezvous_server.py for the same fix.
-        sock.ioctl(socket.SIO_UDP_CONNRESET, False)
+    # Punching at a port that isn't open yet often triggers ICMP "port
+    # unreachable"; on Windows that would break the next recv. See the helper.
+    disable_udp_connreset(sock)
     sock.bind((host, port))
     sock.setblocking(False)
     return sock
