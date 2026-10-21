@@ -625,7 +625,8 @@ class ShareDialog(QDialog):
             retry = QPushButton("Try again")
             retry.setObjectName("small")
             retry.setToolTip("Ask the router to open the port again, e.g. after turning on UPnP")
-            retry.clicked.connect(lambda: (on_retry(), self.accept()))
+            retry.clicked.connect(on_retry)
+            retry.clicked.connect(self.accept)
             row.addWidget(retry)
         copy = QPushButton("Copy")
         copy.setObjectName("primary")
@@ -1080,13 +1081,18 @@ class MainWindow(QMainWindow):
     def open_join(self, page="choose"):
         saved = (self.s or {}).get("saved", {})
         d = StartDialog(self, saved, (self.s or {}).get("me", {}).get("name"), page)
-        if d.exec() == QDialog.Accepted and d.result_cmd:
-            self.engine.command(**d.result_cmd)
+        accepted = d.exec() == QDialog.Accepted and d.result_cmd
+        cmd = d.result_cmd
+        d.deleteLater()  # free the dialog on Qt's side now, not at interpreter exit
+        if accepted:
+            self.engine.command(**cmd)
 
     def open_invite(self):
         if self.s and self.s.get("code_display"):
-            ShareDialog(self, self.s["network"], self.s["code_display"], self.s["hosting"],
-                        on_retry=self.retry_ports).exec()
+            d = ShareDialog(self, self.s["network"], self.s["code_display"], self.s["hosting"],
+                            on_retry=self.retry_ports)
+            d.exec()
+            d.deleteLater()
 
     def retry_ports(self):
         self.reopen_invite = True  # show the result when the router has answered
