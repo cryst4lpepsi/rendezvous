@@ -5,6 +5,9 @@ on:
     branches: [main, "claude/**"]
   workflow_dispatch:
 
+permissions:
+  contents: write   # to publish the "latest" release
+
 jobs:
   build-and-test:
     runs-on: windows-latest
@@ -31,10 +34,13 @@ jobs:
           Expand-Archive wintun.zip -DestinationPath wintun-dl
           Copy-Item wintun-dl/wintun/bin/amd64/wintun.dll .
 
+      - name: App icon
+        run: python tools/make_icon.py rendezvous.ico
+
       - name: Build Rendezvous.exe
         run: >
           pyinstaller --noconfirm --onefile --windowed --uac-admin --name Rendezvous
-          --add-data "dashboard.html;." --add-binary "wintun.dll;."
+          --add-data "dashboard.html;." --add-binary "wintun.dll;." --icon rendezvous.ico
           --hidden-import vnet --collect-submodules uvicorn --collect-submodules websockets
           --exclude-module tkinter
           app.py
@@ -42,7 +48,7 @@ jobs:
       - name: Build Rendezvous-console.exe (same app, shows its log in a console)
         run: >
           pyinstaller --noconfirm --onefile --console --uac-admin --name Rendezvous-console
-          --add-data "dashboard.html;." --add-binary "wintun.dll;."
+          --add-data "dashboard.html;." --add-binary "wintun.dll;." --icon rendezvous.ico
           --hidden-import vnet --collect-submodules uvicorn --collect-submodules websockets
           --exclude-module tkinter
           app.py
@@ -60,7 +66,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory release | Out-Null
-          Copy-Item dist/Rendezvous.exe, dist/Rendezvous-console.exe, rendezvous_server.py, README.md release/
+          Copy-Item dist/Rendezvous.exe, dist/Rendezvous-console.exe, rendezvous_server.py, README.md, docs/PROJECT.md release/
 
       - uses: actions/upload-artifact@v4
         with:
@@ -90,3 +96,14 @@ jobs:
         with:
           name: app-window-screenshot
           path: app-window*.png
+
+      - name: Publish as the "latest" release (stable download link)
+        if: success() && github.event_name == 'push'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest release/Rendezvous.exe release/Rendezvous-console.exe release/rendezvous_server.py release/PROJECT.md \
+            --target ${{ github.sha }} --prerelease --title "Rendezvous - latest build" \
+            --notes "Download **Rendezvous.exe** and run it (accept the administrator prompt). Built from ${{ github.sha }} on branch ${{ github.ref_name }} after all tests passed."

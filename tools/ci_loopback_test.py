@@ -121,16 +121,18 @@ def main():
     except OSError as e:
         print(f"[WARN] real mailbox ({hosting.MAILBOX_URL}) unreachable: {e}", flush=True)
 
-    try:
-        es = hosting.EmbeddedServer(0, "ci-turn")
-        relay, err = hosting.open_turn_relay(es.server)
-        print(f"[{'PASS' if relay else 'WARN'}] real TURN relay ({hosting.TURN_SERVERS.split(':')[0]}): "
-              + (f"relay address {relay.relayed}" if relay else err), flush=True)
-        if relay:
-            relay.close()
-        es.stop()
-    except OSError as e:
-        print(f"[WARN] real TURN relay: {e}", flush=True)
+    for host, port, user, password in hosting.turn_servers():  # each one, to see which are alive
+        try:
+            es = hosting.EmbeddedServer(0, "ci-turn")
+            try:
+                relay = hosting.TurnRelay(es.server, host, port, user, password)
+                relay.allocate()
+                print(f"[PASS] real TURN relay {host}:{port}: relay address {relay.relayed}", flush=True)
+                relay.close()
+            finally:
+                es.stop()
+        except (hosting.PortMapError, OSError) as e:
+            print(f"[WARN] real TURN relay {host}:{port}: {e}", flush=True)
 
     if sys.platform == "win32":
         gw = hosting.default_gateway()

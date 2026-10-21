@@ -600,7 +600,10 @@ class Mailbox:
 # the host. Like Radmin's relays: slower than direct, but it always works.
 # Format: host:port:username:password[,more]
 STUN_MAGIC = rendezvous_server.STUN_MAGIC
-TURN_SERVERS = os.environ.get("RENDEZVOUS_TURN", "openrelay.metered.ca:80:openrelayproject:openrelayproject")
+# Free public relays that publish their credentials; tried in order.
+TURN_SERVERS = os.environ.get("RENDEZVOUS_TURN", "freeturn.net:3478:free:free,"
+                              "openrelay.metered.ca:3478:openrelayproject:openrelayproject,"
+                              "openrelay.metered.ca:80:openrelayproject:openrelayproject")
 
 
 def turn_servers():
@@ -740,6 +743,8 @@ class PunchHost:
         self.knocks = 0
         self.relay = None        # TurnRelay, the last resort for friends who can't punch
         self.relay_error = None
+        self.relay_tried = threading.Event()
+        self.announced = False
 
     def start(self):
         """Blocking. Returns True when the host is announced."""
@@ -753,20 +758,39 @@ class PunchHost:
         # "symmetric" NAT: punching will most likely fail.
         self.symmetric = len(eps) > 1 and eps[0][1] != eps[1][1]
         self.server.public_ip = self.endpoint[0]
-        self.relay, self.relay_error = open_turn_relay(self.server)
-        if self.relay:
-            self.server.turn = self.relay
-            log.info("TURN relay %s gave us %s:%s for friends who can't punch", self.relay.name, *self.relay.relayed)
-        else:
-            log.info("no TURN relay (%s): friends who can't punch won't get in", self.relay_error)
+        # A relay usually answers within a second; a dead one costs a few
+        # seconds each, so don't hold up the announcement for long.
+        threading.Thread(target=self._open_relay, name="turn-relay", daemon=True).start()
+        self.relay_tried.wait(4)
         try:
             self.announce()
+            self.announced = True
         except OSError as e:
             self.error = f"couldn't reach the mailbox service ({MAILBOX_URL}): {e}"
             return False
         self.mailbox.listen(self._on_message, self.stop)
         threading.Thread(target=self._keepalive, name="punch-keepalive", daemon=True).start()
         return True
+
+    def _open_relay(self):
+        relay, err = open_turn_relay(self.server)
+        if self.stop.is_set():
+            if relay:
+                relay.close()
+            return
+        self.relay, self.relay_error = relay, err
+        self.server.turn = relay
+        self.server.turn_peers.clear()
+        if relay:
+            log.info("TURN relay %s gave us %s:%s for friends who can't punch", relay.name, *relay.relayed)
+        else:
+            log.info("no TURN relay (%s): friends who can't punch won't get in", err)
+        if relay and self.announced:  # came after the announcement: tell joiners
+            try:
+                self.announce()
+            except OSError as e:
+                log.info("mailbox re-announce failed: %s", e)
+        self.relay_tried.set()
 
     def announce(self):
         lan = self.info["lan_ip"]
@@ -797,10 +821,10 @@ class PunchHost:
                     self.relay.refresh()
                 except (PortMapError, OSError) as e:
                     log.info("TURN refresh failed (%s), allocating again", e)
-                    self.relay, self.relay_error = open_turn_relay(self.server)
-                    self.server.turn = self.relay
-                    self.server.turn_peers.clear()
-                    last_announce = 0  # announce the new relay address
+                    self.relay, last_relay = None, 0
+            if not self.relay and self.relay_tried.is_set() and time.time() - last_relay > 300:
+                last_relay = time.time()
+                self._open_relay()  # announces the new relay address itself
             servers = stun_servers()
             ep = self.server.stun(servers[0]) if servers else None
             changed = bool(ep) and ep != self.endpoint

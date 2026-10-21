@@ -22,6 +22,10 @@ into the same switch.
   connection's state live as it changes, and has buttons that force path
   changes during a demo.
 
+**New here, or preparing a presentation?** [docs/PROJECT.md](docs/PROJECT.md)
+explains the project in plain words, and has a demo script, a troubleshooting
+table and viva questions with answers.
+
 ![The app with three players: dave direct, bob on relay (forced), carol reconnecting after its direct path was dropped](docs/app.png)
 
 ```
@@ -38,9 +42,11 @@ tools/                 test scripts: NAT/CGNAT/UPnP labs, stand-in STUN + mailbo
 
 ## Playing LAN games with friends
 
-Download **Rendezvous.exe** from the latest successful
-[Windows app](../../actions/workflows/windows-app.yml) build (open the run, then
-the *Rendezvous-windows* artifact). Every player uses the same exe. Start it and
+Download **[Rendezvous.exe](../../releases/download/latest/Rendezvous.exe)**
+from the [latest release](../../releases/tag/latest). CI rebuilds it on every
+change that passes the Windows tests. Each run's
+[build artifacts](../../actions/workflows/windows-app.yml) work too. Every
+player uses the same exe. Start it and
 accept the administrator prompt: creating a network adapter needs admin rights,
 as with Radmin. Windows SmartScreen may warn because the exe isn't signed; use
 *More info → Run anyway*.
@@ -146,7 +152,11 @@ player only, or on everyone when no player is selected.
   code (see above), which works with most connections. If a friend gets
   *"couldn't punch through to the host … symmetric NAT"*, one of the two
   connections changes ports for every destination, which hole punching can't
-  get through. Let someone else host, or use a cloud server (below).
+  get through. The host's app keeps a free public **TURN relay** ready for
+  that case, and the friend's app tries it automatically. The message only
+  appears when that relay can't be reached either. Then let someone else
+  host, use a cloud server (below), or name your own TURN server with
+  `RENDEZVOUS_TURN=host:port:user:pass`.
 - **"Couldn't reach the host"** when joining: check the network name and code,
   that the host has Rendezvous open, and that their port is open (see above).
 - **A player stays on RELAY**: their network blocks hole punching (symmetric
@@ -338,8 +348,9 @@ relays only for the address a peer registered from.
   - bob, on another network, joins with name + code, knocks through the
     mailbox, alice's server punches back, and the whole mesh goes DIRECT;
   - carol, in alice's house, is found by the local broadcast;
-  - with bob behind a symmetric NAT, punching fails and he gets a clear message
-    after 25 s instead of hanging.
+  - with bob behind a symmetric NAT, punching fails and he joins through a
+    TURN relay (coturn in the lab) instead. With no relay he gets a clear
+    message after 25 s instead of hanging.
   - CI also checks the real STUN servers and ntfy.sh from Windows.
 - **Hosting through a real UPnP router** (`tools/upnplab.sh`: the same lab with
   `miniupnpd` on alice's router, no cloud server):
@@ -356,7 +367,9 @@ relays only for the address a peer registered from.
   joins with name + code, and a wrong network name doesn't get in. With `--exe` it also
   checks that the built app joins and brings up its adapter.
 - **`tools/wintun_smoke.py`**: on the real adapter, checks outbound unicast,
-  subnet and `255.255.255.255` broadcast, multicast, inbound UDP and ping.
+  subnet and `255.255.255.255` broadcast, multicast, inbound UDP and ping, and
+  that an inbound Minecraft "Open to LAN" announcement (`224.0.2.60:4445`) and
+  inbound broadcasts reach an ordinary listening program.
 - **GitHub Actions** (`.github/workflows/windows-app.yml`) runs both of those
   on a real Windows machine, builds the `.exe` files, and tests the built exe.
 
