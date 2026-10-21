@@ -4,10 +4,11 @@ Rendezvous puts up to 8 PCs on the same virtual LAN over the internet, like
 Radmin VPN or Hamachi. LAN games see each other as if the PCs were plugged
 into the same switch.
 
-- One player clicks **Host a network**. Their app runs the **rendezvous
-  server**, opens the router port with UPnP, and gives them an **invite code**.
-  Everyone else clicks **Join a network** and pastes it. No cloud server or
-  account is needed. A cloud server still works for networks that can't host.
+- One player clicks **Host a network** and picks a network name. Their app
+  runs the **rendezvous server**, opens the router port with UPnP, and shows a
+  **10-digit code**. Everyone else clicks **Join a network** and types the
+  network name and the code. No cloud server, account or lookup service is
+  needed. A cloud server still works for networks that can't host.
 - The server introduces the players and gives each one a virtual IP
   (`10.77.0.x`).
 - Every pair of players tries **UDP hole punching** to get a **direct**
@@ -23,7 +24,7 @@ into the same switch.
 
 ```
 app.py                 the desktop app (what Rendezvous.exe runs): native Qt window, Host / Join
-hosting.py             hosting from the app: built-in server, UPnP port forwarding, invite codes
+hosting.py             hosting from the app: built-in server, UPnP port forwarding, join codes, LAN discovery
 peer.py                the engine: per-player state machines, tunnel, virtual LAN routing; web dashboard for the CLI demo
 vnet.py                the virtual adapter: Wintun on Windows, /dev/net/tun on Linux
 dashboard.html         the web dashboard used by the command-line demo (peer.py)
@@ -44,29 +45,43 @@ as with Radmin. Windows SmartScreen may warn because the exe isn't signed; use
 
 ### Host (one player)
 
-1. Click **Host a network**. Choose a network name and password, enter your
-   name, and click **Start hosting**.
+1. Click **Host a network**, choose a **network name** (e.g. `Friday Games`),
+   enter your name, and click **Start hosting**.
 2. The app starts the network on your PC and asks your router to forward its
    port (UPnP). The **Invite friends** window then shows:
-   - your **invite code** (`RZ1-…`), with a **Copy code** button;
+   - the **network name** and a **10-digit code** like `423 122 2530`, with
+     a **Copy** button;
    - whether the port was opened (✓), or what to do if it wasn't (⚠).
-3. Send the code to your friends. Keep Rendezvous open while you play: the
-   network runs on your PC. **Stop hosting** closes it and removes the port
-   forwarding.
+3. Tell your friends the name and the code. Keep Rendezvous open while you
+   play: the network runs on your PC. **Stop hosting** closes it and removes
+   the port forwarding.
 
 ### Join (everyone else)
 
-1. Copy the invite code, click **Join a network**, paste it (it fills itself in
-   if it's on the clipboard), enter your name, and click **Join**.
+1. Click **Join a network** and type the **network name** and the **code**
+   (capitals and spaces don't matter), plus your name. Click **Join**.
 2. Your virtual IP appears at the top right, e.g. **10.77.0.2**. Each other
    player shows up as a node and goes **PUNCHING → DIRECT** (or **RELAY**).
-   Friends in the host's own house also work: if the router can't route
-   back to its own public address, the app switches to the host's LAN address
-   by itself.
 
-The app remembers your network and reconnects next time (a host hosts again).
-**Invite friends…** is available to everyone in the network. Closing the window
-leaves the network and removes the adapter.
+A mistyped name or code can't find the host; the app gives up after a few
+seconds and says so. The app remembers your network and reconnects next time
+(a host hosts again). **Invite friends…** shows the name and code to anyone in
+the network. Closing the window leaves the network and removes the adapter.
+
+#### How a 10-digit code can be enough
+
+There is no lookup service behind the code: the code *is* the host's address.
+An IPv4 address is a 32-bit number (at most 4,294,967,295), so it fits in 10
+digits. The app scrambles it with the network name (XOR with a hash of the
+name), so the code alone doesn't reveal the address, and a friend who types the
+same name gets it back. The port is fixed at 9000. If the router has to use
+another port, the code gets a short suffix like `:9001`. Friends in the host's
+own home are found by a quick broadcast on the local network instead, since
+many routers can't route back to their own public address.
+
+The code is the host's address in disguise, not a strong password. Anyone who
+knows the network name and the host's public IP could work it out. That's fine
+for games with friends, but don't treat it as security.
 
 ### Play
 
@@ -82,15 +97,15 @@ player only, or on everyone when no player is selected.
 
 ### If something doesn't work
 
-- **The invite window shows ⚠ "Couldn't open the port automatically"**: your
+- **The Invite friends window shows ⚠ "Couldn't open the port automatically"**: your
   router has UPnP turned off. Turn it on in the router settings, or forward
   **UDP 9000** to the PC shown in the message. Friends on your own network can
   join either way.
 - **⚠ "not public … CGNAT"**: your internet provider shares one public address
   between many customers, so nobody outside can reach you. Let a friend with a
   normal connection host, or use a cloud server (below).
-- **"Rendezvous server not responding"** when joining: the host isn't running
-  or isn't reachable (see above).
+- **"Couldn't reach the host"** when joining: check the network name and code,
+  that the host has Rendezvous open, and that their port is open (see above).
 - **A player stays on RELAY**: their network blocks hole punching (symmetric
   NAT, CGNAT on many mobile networks). It still works, just through the host.
 - **The game doesn't see the host**: check the host's virtual IP is pingable
@@ -113,8 +128,8 @@ python3 rendezvous_server.py
 ```
 
 Allow **UDP 9000** inbound in its firewall. Then everyone picks **Join a
-network → No code? Enter a rendezvous server**, and enters `<server-ip>:9000`
-plus the same network name and password.
+network**, ticks **Using a rendezvous server instead?**, and enters
+`<server-ip>:9000` plus the same network name (and password, if you use one).
 
 To run the app from source instead of the exe: `py -m pip install -r
 requirements.txt`, then `py app.py` in an administrator terminal.
@@ -270,15 +285,15 @@ relays only for the address a peer registered from.
   `miniupnpd` on alice's router, no cloud server):
   - alice hosts. The app finds the router, reads its public IP, and forwards
     both her server port and her tunnel port.
-  - bob joins from another network with only the invite code: DIRECT.
-  - carol, in alice's house, joins with the same code. The router can't loop
-    back to its own public address, so she falls back to alice's LAN address
-    by herself.
+  - bob joins from another network with just the network name and the 10-digit
+    code: DIRECT.
+  - carol, in alice's house, types the same name and code. The local broadcast
+    finds alice right away.
   - The virtual LAN works across all three. When alice quits, the router
     forwarding is removed.
 - **`tools/ci_loopback_test.py`**: three peers on loopback reach a full DIRECT
   mesh. Force Relay, chat over relay and Re-punch work. In host mode, a peer
-  joins with an invite code and a wrong password is refused. With `--exe` it also
+  joins with name + code, and a wrong network name doesn't get in. With `--exe` it also
   checks that the built app joins and brings up its adapter.
 - **`tools/wintun_smoke.py`**: on the real adapter, checks outbound unicast,
   subnet and `255.255.255.255` broadcast, multicast, inbound UDP and ping.
@@ -292,7 +307,7 @@ relays only for the address a peer registered from.
 --room NAME            network name (default "demo"); --password to protect it
 --name NAME            display name (default: computer name)
 --host                 host the network (built-in server + UPnP); --host-port, --no-upnp
---invite RZ1-...       join with an invite code
+--code 1234567890      join a hosted network with its code (network name in --room)
 --vlan                 create the virtual adapter (always on in the app; --no-vlan to disable)
 --http-port N          dashboard port (default 8080)
 --punch-timeout S      punch this long before falling back (default 5)

@@ -5,14 +5,15 @@ When you click "Host", your app:
   1. starts the rendezvous server inside the app (same code as rendezvous_server.py),
   2. asks your home router to forward its UDP port to this PC, using UPnP
      (the same mechanism games and consoles use to "open NAT"),
-  3. builds an INVITE CODE: your public address + network name + password,
-     packed into one string your friends paste into "Join".
+  3. makes a 10-digit JOIN CODE from your public address. Friends type your
+     network name + that code into "Join". Nothing else is involved: the code
+     itself tells their app where you are.
 
 If the router doesn't do UPnP, you can forward the port by hand, or everyone can
 use a rendezvous server on a cloud VM instead (rendezvous_server.py).
 """
 
-import base64
+import hashlib
 import ipaddress
 import json
 import logging
@@ -29,37 +30,96 @@ import rendezvous_server
 
 log = logging.getLogger("hosting")
 
-INVITE_PREFIX = "RZ1-"
 SSDP_ADDR = ("239.255.255.250", 1900)
 WAN_SERVICES = ("urn:schemas-upnp-org:service:WANIPConnection:2",
                 "urn:schemas-upnp-org:service:WANIPConnection:1",
                 "urn:schemas-upnp-org:service:WANPPPConnection:1")
 
 
-# ================================================================ invite codes
-def make_invite(server, network, password="", lan=None):
-    """One copy-pasteable string with everything a friend needs to join.
-    `lan` is the host's LAN address, tried when the public one doesn't answer
-    (friends in the same house, behind a router without NAT loopback)."""
-    d = {"s": server, "n": network, "p": password}
-    if lan and lan != server:
-        d["l"] = lan
-    raw = json.dumps(d, separators=(",", ":")).encode()
-    return INVITE_PREFIX + base64.urlsafe_b64encode(raw).decode().rstrip("=")
+# ================================================================ join codes
+DEFAULT_PORT = 9000
 
 
-def parse_invite(code):
-    """Returns {"server", "network", "password", "alt"} or raises ValueError."""
-    code = re.sub(r"\s+", "", code or "")
-    if not code.upper().startswith(INVITE_PREFIX):
-        raise ValueError("an invite code starts with RZ1-")
-    body = code[len(INVITE_PREFIX):]
+def room_for(network):
+    """Network names are case-insensitive: "Friday" and "friday" are one network."""
+    return " ".join((network or "").split()).lower()
+
+
+def _key(network):
+    return int.from_bytes(hashlib.sha256(room_for(network).encode()).digest()[:4], "big")
+
+
+def make_code(network, ip, port=DEFAULT_PORT):
+    """
+    The host's join code: its public IPv4 address (a 32-bit number, so it fits
+    in 10 digits) scrambled with the network name. A friend who types the same
+    network name gets the address back; no lookup service is needed. A port
+    other than 9000 is added as ":port".
+    """
+    code = f"{int(ipaddress.IPv4Address(ip)) ^ _key(network):010d}"
+    return code if port == DEFAULT_PORT else f"{code}:{port}"
+
+
+def format_code(code):
+    """1234567890 -> "123 456 7890" (easier to read out or type)."""
+    digits, _, port = code.partition(":")
+    return f"{digits[:3]} {digits[3:6]} {digits[6:]}" + (f" :{port}" if port else "")
+
+
+def parse_code(network, text):
+    """Returns (ip, port) for a code typed by a friend, or raises ValueError."""
+    t = re.sub(r"[\s.\-]", "", text or "")
+    digits, _, port = t.partition(":")
+    if not digits.isdigit() or len(digits) != 10 or (port and not port.isdigit()):
+        raise ValueError("the code is 10 digits, like 123 456 7890")
+    n = int(digits)
+    if n >= 2 ** 32:
+        raise ValueError("that code isn't valid, check the digits")
+    if not room_for(network):
+        raise ValueError("enter the network name too")
+    ip = str(ipaddress.IPv4Address(n ^ _key(network)))
+    return ip, int(port) if port else DEFAULT_PORT
+
+
+def find_on_lan(network, port=DEFAULT_PORT, timeout=1.2):
+    """
+    Ask the local network "is anyone hosting <network>?" (UDP broadcast). This
+    is how friends in the host's own home find it, since many routers can't
+    route back to their own public address. Returns "ip:port" or None.
+    """
+    lan = lan_ip_towards("8.8.8.8")
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     try:
-        d = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
-        return {"server": str(d["s"]), "network": str(d["n"]), "password": str(d.get("p", "")),
-                "alt": str(d["l"]) if d.get("l") else None}
-    except (ValueError, KeyError, TypeError):
-        raise ValueError("this invite code is damaged - copy it again") from None
+        s.bind((lan or "0.0.0.0", 0))  # send out of the real network card, not the virtual one
+    except OSError:
+        s.bind(("0.0.0.0", 0))
+    msg = json.dumps({"t": "find", "room": room_for(network)}).encode()
+    targets = ["255.255.255.255"]
+    if lan:
+        targets.append(str(ipaddress.ip_network(f"{lan}/24", strict=False).broadcast_address))
+    for target in targets:
+        try:
+            s.sendto(msg, (target, port))
+        except OSError:
+            pass
+    s.settimeout(0.2)
+    end = time.time() + timeout
+    try:
+        while time.time() < end:
+            try:
+                data, addr = s.recvfrom(2048)
+            except (socket.timeout, ConnectionResetError):
+                continue
+            try:
+                m = json.loads(data)
+            except ValueError:
+                continue
+            if isinstance(m, dict) and m.get("t") == "here" and m.get("room") == room_for(network):
+                return f"{addr[0]}:{addr[1]}"
+    finally:
+        s.close()
+    return None
 
 
 def is_private(ip):

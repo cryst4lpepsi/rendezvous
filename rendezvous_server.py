@@ -204,6 +204,10 @@ class RendezvousServer:
             self.on_relay(msg, addr, size)
         elif t == "bye":
             self.on_bye(msg, addr)
+        elif t == "find":
+            # LAN discovery (see hosting.find_on_lan): answer if we host that network.
+            if self.only_room is not None and msg.get("room") == self.only_room:
+                self.send({"t": "here", "room": self.only_room}, addr)
         else:
             log.debug("drop: unknown message type %r from %s", t, addr)
 
