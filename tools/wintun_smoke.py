@@ -160,6 +160,33 @@ def main():
     inbound("broadcast 255.255.255.255", "255.255.255.255", 4447, lambda r: None)
     inbound("subnet broadcast 10.77.0.255", "10.77.0.255", 4448, lambda r: None)
 
+    if sys.platform == "win32":
+        # A game whose firewall prompt was answered with the default gets an
+        # allow rule for Private networks and a block rule for Public ones. The
+        # app marks the virtual LAN Private so such a game still gets players.
+        # Reported as WARN (not FAIL) while we learn how every Windows behaves.
+        for _ in range(30):
+            if a.network_category == "Private":
+                break
+            time.sleep(1)
+        print(f"[{'PASS' if a.network_category == 'Private' else 'WARN'}] virtual LAN network profile: "
+              f"{a.network_category or 'not identified yet'}", flush=True)
+        rule = ["name=Rendezvous smoke block"]
+        vnet._run(["netsh", "advfirewall", "firewall", "add", "rule", *rule, "dir=in", "action=block",
+                   f"program={sys.executable}", "profile=public", "protocol=UDP"], check=False)
+        time.sleep(1)
+        r = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        r.bind((ME, 5001))
+        r.settimeout(3)
+        a.write(udp(REMOTE, ME, 6001, 5001, b"blocked-on-public"))
+        try:
+            data, src = r.recvfrom(100)
+            print(f"[PASS] game blocked on Public networks still gets inbound UDP from {src}", flush=True)
+        except socket.timeout:
+            print("[WARN] game blocked on Public networks gets nothing (adapter isn't Private)", flush=True)
+        r.close()
+        vnet._run(["netsh", "advfirewall", "firewall", "delete", "rule", *rule], check=False)
+
     a.close()
     print(f"{sum(results)}/{len(results)} checks passed")
     return 0 if all(results) else 1

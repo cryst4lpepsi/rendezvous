@@ -601,8 +601,7 @@ class Mailbox:
 # Format: host:port:username:password[,more]
 STUN_MAGIC = rendezvous_server.STUN_MAGIC
 # Free public relays that publish their credentials; tried in order.
-TURN_SERVERS = os.environ.get("RENDEZVOUS_TURN", "freeturn.net:3478:free:free,"
-                              "openrelay.metered.ca:3478:openrelayproject:openrelayproject,"
+TURN_SERVERS = os.environ.get("RENDEZVOUS_TURN", "freestun.net:3478:free:free,"
                               "openrelay.metered.ca:80:openrelayproject:openrelayproject")
 
 

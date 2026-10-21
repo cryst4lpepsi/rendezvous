@@ -97,6 +97,7 @@ class _Base:
         self.prefix = None
         self._running = False
         self._thread = None
+        self.network_category = None  # Windows: "Private" once _make_private succeeded
 
     def start(self, on_packet):
         """Start a reader thread that calls on_packet(bytes) for every packet
@@ -284,6 +285,35 @@ class WintunAdapter(_Base):
         _run(["netsh", "advfirewall", "firewall", "add", "rule", "name=Rendezvous VLAN", "dir=in",
               "action=allow", "protocol=any", f"remoteip={subnet}"], check=False)
         self.ip, self.prefix = ip, prefix
+        threading.Thread(target=self._make_private, name="vnet-profile", daemon=True).start()
+
+    def _make_private(self):
+        """Mark the virtual LAN as a Private network, like a home LAN. When a
+        game's firewall prompt is answered with its default (Private ticked),
+        Windows adds an allow rule for Private and a *block* rule for Public
+        networks, and block rules beat our allow rule above: on a Public
+        adapter, a hosted Minecraft LAN world couldn't accept anyone."""
+        ps = (f"$p = Get-NetConnectionProfile -InterfaceAlias '{self.name}' -ErrorAction SilentlyContinue; "
+              f"if (-not $p) {{ 'none' }} elseif ($p.NetworkCategory -eq 'Private') {{ 'Private' }} "
+              f"else {{ Set-NetConnectionProfile -InterfaceAlias '{self.name}' -NetworkCategory Private; "
+              f"(Get-NetConnectionProfile -InterfaceAlias '{self.name}').NetworkCategory }}")
+        for _ in range(20):  # the profile appears a few seconds after the address
+            try:
+                r = _run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], check=False)
+            except OSError as e:
+                log.info("couldn't check the network profile: %s", e)
+                return
+            out = r.stdout.strip().splitlines()[-1:] or [""]
+            if out[0] in ("Private", "DomainAuthenticated"):
+                self.network_category = "Private"
+                log.info("virtual LAN marked as a Private network (games' firewall rules apply)")
+                return
+            if out[0] not in ("none", ""):
+                self.network_category = out[0]
+            time.sleep(3)
+        log.warning("couldn't mark the virtual LAN as a Private network (it is %s): if a game can't be "
+                    "joined, allow it in Windows Firewall for Public networks too",
+                    self.network_category or "unidentified")
 
     def _read_loop(self, on_packet):
         ct, dll = self.ct, self.dll

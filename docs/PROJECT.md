@@ -113,6 +113,9 @@ TURN relay for players who can't punch.
 - **Adapter set up for games.** Interface metric 1 so broadcasts and multicast
   prefer it. MTU 1280, so a game packet plus our header never needs
   fragmenting. A firewall rule lets the whole `10.77.0.0/24` network in.
+  The adapter is marked a **Private** network. Otherwise a game whose
+  firewall prompt was answered with the default ("Private" ticked) would be
+  *blocked* on it, and block rules win over allow rules.
 - **Port opening.** UPnP with three discovery rounds and a unicast query
   straight to the gateway, then NAT-PMP. Leases renewed every 20 minutes.
   **Try again** button after you enable UPnP on the router. Removed again on
@@ -173,6 +176,7 @@ Before the demo:
 | Router address `100.64.x.x – 100.127.x.x` | provider CGNAT | Nothing needed: the app uses hole punching and gives a 6-digit code. |
 | Friend: "couldn't punch through … symmetric NAT" | strict NAT on one side, and the TURN relay unreachable | Let someone else host. Or run `rendezvous_server.py` on any machine with a public IP (a free cloud VM) and use **Using a rendezvous server instead?** Or set your own TURN server with `RENDEZVOUS_TURN=host:port:user:pass`. |
 | One player stays `RELAY` | their network blocks punching (mobile data, university Wi-Fi) | Works as is, slightly higher ping. |
+| Friends see the world but can't join it | the host once answered the game's firewall prompt with "Private only", so Windows blocks it on Public networks | The app marks the virtual LAN as a **Private** network, so this normally can't happen. If the log says it couldn't, open *Windows Security → Firewall → Allow an app*, find **Java(TM) Platform SE binary** (Minecraft Java) or the game, and tick **Public** too. |
 | Game doesn't list the LAN world | game's own firewall prompt was denied; different game versions | Allow the game in Windows Firewall. Check versions match. Use **Direct connect** to `10.77.0.x` (Minecraft LAN worlds use a random port shown in chat on the host). |
 | "Virtual LAN unavailable" | admin prompt declined | Restart and accept it. |
 | SmartScreen "Windows protected your PC" | exe isn't code-signed | **More info → Run anyway**. |

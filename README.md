@@ -163,8 +163,12 @@ player only, or on everyone when no player is selected.
   NAT, CGNAT on many mobile networks). It still works, just through the host.
 - **The game doesn't see the host**: check the host's virtual IP is pingable
   (`ping 10.77.0.x`). The app adds a firewall rule allowing inbound traffic
-  from the virtual LAN. A game with its own firewall prompt still needs to be
-  allowed.
+  from the virtual LAN, and marks the virtual LAN as a **Private** network.
+  When a game's firewall prompt is answered with its default, Windows allows
+  the game on Private networks and blocks it on Public ones. If the log says
+  the network couldn't be made Private, allow the game for Public networks
+  too (*Windows Security → Firewall → Allow an app*; for Minecraft Java it's
+  "Java(TM) Platform SE binary").
 - **"Virtual LAN unavailable"**: the app wasn't started as administrator. The
   tunnel and chat still work.
 
