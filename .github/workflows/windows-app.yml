@@ -47,6 +47,15 @@ jobs:
           --exclude-module tkinter
           app.py
 
+      - name: Check both exes always ask for administrator rights
+        shell: pwsh
+        run: |
+          foreach ($f in "dist/Rendezvous.exe", "dist/Rendezvous-console.exe") {
+            $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($f))
+            if ($text -notmatch 'requireAdministrator') { throw "$f does not request administrator rights" }
+            Write-Host "$f : manifest has requireAdministrator"
+          }
+
       - name: Package
         shell: pwsh
         run: |

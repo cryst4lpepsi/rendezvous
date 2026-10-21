@@ -147,7 +147,14 @@ network**, ticks **Using a rendezvous server instead?**, and enters
 `<server-ip>:9000` plus the same network name (and password, if you use one).
 
 To run the app from source instead of the exe: `py -m pip install -r
-requirements.txt`, then `py app.py` in an administrator terminal.
+requirements.txt`, then `py app.py`.
+
+**Administrator rights.** Creating the virtual network adapter needs them, so
+the app always runs as administrator. `Rendezvous.exe` is built to request it:
+Windows shows the usual admin prompt every time it starts, and CI checks the
+flag is there. Run from source (`py app.py`, or `py peer.py --vlan`), it
+relaunches itself as administrator. If you decline the prompt, the app still
+runs, with tunnel and chat but no virtual LAN, and says so.
 
 ## Demo on one laptop (no admin, no adapter)
 

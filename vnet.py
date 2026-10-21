@@ -49,6 +49,37 @@ class VnetError(Exception):
     """A user-facing problem setting up the adapter (shown on the dashboard)."""
 
 
+def is_admin():
+    if sys.platform == "win32":
+        import ctypes
+        try:
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except (OSError, AttributeError):
+            return False
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def relaunch_as_admin():
+    """
+    Windows: creating the virtual adapter needs administrator rights, so if we
+    don't have them, start this same program again "as administrator" (the
+    usual UAC prompt) and let the caller exit. Returns True if the elevated
+    copy was started. The built Rendezvous.exe asks for admin by itself (its
+    manifest says so); this covers running from source (python app.py).
+    """
+    if sys.platform != "win32" or is_admin() or "--elevated" in sys.argv:
+        return False
+    import ctypes
+    args = sys.argv[1:] + ["--elevated"]  # --elevated: never try twice
+    params = args if getattr(sys, "frozen", False) else [os.path.abspath(sys.argv[0])] + args
+    rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, subprocess.list2cmdline(params),
+                                             os.getcwd(), 1)
+    if rc <= 32:  # e.g. 5 = the user clicked "No" on the UAC prompt
+        log.warning("not running as administrator (UAC declined): the virtual LAN won't be available")
+        return False
+    return True
+
+
 def open_adapter(name=ADAPTER_NAME):
     if sys.platform == "win32":
         return WintunAdapter(name)

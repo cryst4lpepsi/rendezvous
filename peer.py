@@ -1252,6 +1252,7 @@ def build_parser():
     ap.add_argument("--config", help="settings file to remember the last network (used by the app)")
     ap.add_argument("--open", action="store_true", help="open the dashboard in a browser")
     ap.add_argument("--verbose", "-v", action="store_true", help="log every packet decision")
+    ap.add_argument("--elevated", action="store_true", help=argparse.SUPPRESS)  # set by relaunch_as_admin()
     ap.set_defaults(app_mode=False)
     return ap
 
@@ -1274,6 +1275,10 @@ def setup_logging(verbose, logfile=None):
 
 def main():
     args = build_parser().parse_args()
+    if args.vlan:
+        import vnet
+        if vnet.relaunch_as_admin():
+            return  # the administrator copy takes over
     setup_logging(args.verbose)
     try:
         asyncio.run(run(args))

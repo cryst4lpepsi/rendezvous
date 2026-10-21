@@ -1211,6 +1211,10 @@ def main():
     args.app_mode = True
     args.vlan = not args.no_vlan
     args.config = args.config or str(app_dir() / "config.json")
+    if args.vlan:
+        import vnet
+        if vnet.relaunch_as_admin():  # always run as administrator: needed for the virtual network
+            return 0
     peer.setup_logging(args.verbose, logfile=app_dir() / "rendezvous.log")
 
     QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
