@@ -47,8 +47,11 @@ as with Radmin. Windows SmartScreen may warn because the exe isn't signed; use
 
 1. Click **Host a network**, choose a **network name** (e.g. `Friday Games`),
    enter your name, and click **Start hosting**.
-2. The app starts the network on your PC and asks your router to forward its
-   port (UPnP). The **Invite friends** window then shows:
+2. The app starts the network on your PC and asks your router to open its
+   port: UPnP first, then NAT-PMP (which many routers speak when UPnP is off).
+   It also allows itself through Windows Firewall, and renews the router lease
+   every 20 minutes so long sessions don't drop. The **Invite friends** window
+   then shows:
    - the **network name** and a **10-digit code** like `423 122 2530`, with
      a **Copy** button;
    - whether the port was opened (✓), or what to do if it wasn't (⚠).
@@ -97,10 +100,22 @@ player only, or on everyone when no player is selected.
 
 ### If something doesn't work
 
-- **The Invite friends window shows ⚠ "Couldn't open the port automatically"**: your
-  router has UPnP turned off. Turn it on in the router settings, or forward
-  **UDP 9000** to the PC shown in the message. Friends on your own network can
-  join either way.
+- **The Invite friends window shows ⚠ "Your router didn't open the port
+  automatically"**: the router answered neither UPnP nor NAT-PMP. ISP routers
+  often ship with UPnP off. Friends on your own network can join anyway. For
+  everyone else, pick one:
+  1. Open the router's settings page (the message shows its address, usually
+     `http://192.168.0.1` or `http://192.168.1.1`), turn on **UPnP**, then click
+     **Try again** in the Invite friends window. The port opens without
+     restarting, and if the code changes the app tells you.
+  2. Or forward **UDP 9000** to your PC (the message shows its LAN address) in
+     the router's *Port forwarding* / *Virtual server* page. Your code already
+     works then; nothing else is needed.
+  3. Or let a friend whose router does UPnP host instead.
+
+  Without an open port (or a server on the internet) friends can't make the
+  first contact: that is how home routers work, and it's the same for every
+  tool like this.
 - **⚠ "not public … CGNAT"**: your internet provider shares one public address
   between many customers, so nobody outside can reach you. Let a friend with a
   normal connection host, or use a cloud server (below).

@@ -584,7 +584,7 @@ class StartDialog(QDialog):
 class ShareDialog(QDialog):
     """What the host tells friends: the network name and the 10-digit code."""
 
-    def __init__(self, parent, network, code, hosting_info):
+    def __init__(self, parent, network, code, hosting_info, on_retry=None):
         super().__init__(parent)
         self.setWindowTitle("Invite friends")
         self.setMinimumWidth(520)
@@ -621,6 +621,12 @@ class ShareDialog(QDialog):
         warn.setWordWrap(True)
         v.addWidget(warn)
         row = QHBoxLayout()
+        if hosting_info and not hosting_info["reachable"] and on_retry:
+            retry = QPushButton("Try again")
+            retry.setObjectName("small")
+            retry.setToolTip("Ask the router to open the port again, e.g. after turning on UPnP")
+            retry.clicked.connect(lambda: (on_retry(), self.accept()))
+            row.addWidget(retry)
         copy = QPushButton("Copy")
         copy.setObjectName("primary")
         done = QLabel()
@@ -650,6 +656,8 @@ class MainWindow(QMainWindow):
         self.events = []
         self.join_prompted = False
         self.invite_shown_for = None
+        self.reopen_invite = False
+        self.was_busy = False
         self.setWindowTitle("Rendezvous")
         self.resize(1440, 900)
 
@@ -931,6 +939,10 @@ class MainWindow(QMainWindow):
 
         self._render_table(peers)
         self._render_detail(sel, s)
+        if self.reopen_invite and self.was_busy and not s["hosting_busy"]:
+            self.reopen_invite = False
+            QTimer.singleShot(200, self.open_invite)
+        self.was_busy = s["hosting_busy"]
         if h and self.invite_shown_for != s["network"] and s["code_display"]:
             self.invite_shown_for = s["network"]  # just started hosting: show the code once
             QTimer.singleShot(300, self.open_invite)
@@ -1073,7 +1085,12 @@ class MainWindow(QMainWindow):
 
     def open_invite(self):
         if self.s and self.s.get("code_display"):
-            ShareDialog(self, self.s["network"], self.s["code_display"], self.s["hosting"]).exec()
+            ShareDialog(self, self.s["network"], self.s["code_display"], self.s["hosting"],
+                        on_retry=self.retry_ports).exec()
+
+    def retry_ports(self):
+        self.reopen_invite = True  # show the result when the router has answered
+        self.engine.command(cmd="retry_ports")
 
     def copy_ip(self):
         if self.s and self.s["me"]["vip"]:

@@ -96,6 +96,16 @@ def main():
     ok.append(wait(lambda: api(8382)["joined"] is False and len(api(8380)["peers"]) == 1, 20,
                    "host mode: wrong network name doesn't get in, and gives up"))
 
+    if sys.platform == "win32":
+        gw = hosting.default_gateway()
+        print(f"       default gateway from 'route print': {gw}", flush=True)
+        ok.append(bool(gw))
+        print(f"[{'PASS' if ok[-1] else 'FAIL'}] Windows: router address found", flush=True)
+        r = subprocess.run(["netsh", "advfirewall", "firewall", "show", "rule", "name=Rendezvous app"],
+                           capture_output=True, text=True)
+        ok.append(r.returncode == 0 and "Rendezvous app" in r.stdout)
+        print(f"[{'PASS' if ok[-1] else 'FAIL'}] Windows: hosting added the firewall rule for the app", flush=True)
+
     if args.exe:
         # The app is a Qt window; --api adds the JSON API so the test can watch it.
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")

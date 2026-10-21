@@ -267,6 +267,9 @@ class Peer:
         self.event("info", f"{self.name} up: UDP tunnel socket on port {self.udp_port}")
         if self.args.vlan:
             await self._start_vnet()
+            if sys.platform == "win32":  # let punches and players in (Windows Firewall)
+                import hosting
+                await self.loop.run_in_executor(None, hosting.allow_app_through_firewall)
         self._tasks.append(asyncio.create_task(self._ticker()))
 
     async def stop(self):
@@ -406,10 +409,7 @@ class Peer:
             self.push_state()
             return
         self.hosting = info
-        # The join code is our public address; without one (no UPnP, no
-        # internet lookup) it's the LAN address, which still works at home.
-        self.code = hosting.make_code(network, info["public_ip"] or info["lan_ip"] or "127.0.0.1",
-                                      info["server_port"] if info["public_ip"] else info["server"].port)
+        self.code = self._host_code(network, info)
         self.event("good" if info["reachable"] else "warn", info["status"])
         if remember:
             self._save_config(mode="host", network=network, name=(name or self.name),
@@ -417,6 +417,39 @@ class Peer:
         self.join(f"127.0.0.1:{info['server'].port}", network, "", name, remember=False, room=room)
         self.event("good", f"hosting - friends join with network name '{network}' and code "
                            f"{hosting.format_code(self.code)}")
+
+    @staticmethod
+    def _host_code(network, info):
+        # The join code is our public address; without one (router port not
+        # opened, no internet lookup) it's the LAN address, which still works at home.
+        import hosting
+        return hosting.make_code(network, info["public_ip"] or info["lan_ip"] or "127.0.0.1",
+                                 info["server_port"] if info["public_ip"] else info["server"].port)
+
+    def retry_ports(self):
+        """The "Try again" button: ask the router to open the port again (after
+        the user turned UPnP on, for example)."""
+        if self.hosting and not self.hosting_busy:
+            asyncio.ensure_future(self._retry_ports())
+
+    async def _retry_ports(self):
+        import hosting
+        info = self.hosting
+        self.hosting_busy = True
+        self.event("info", "asking the router to open the port again (UPnP, then NAT-PMP)...")
+        self.push_state()
+        info["use_upnp"] = True
+        try:
+            await self.loop.run_in_executor(None, hosting.map_ports, info)
+        finally:
+            self.hosting_busy = False
+        if self.hosting is not info:
+            return
+        old, self.code = self.code, self._host_code(self.network, info)
+        self.event("good" if info["reachable"] else "warn", info["status"])
+        if self.code != old:
+            self.event("warn", f"the join code changed: it is now {hosting.format_code(self.code)}")
+        self.push_state()
 
     def join_code(self, network, code, name=None, remember=True):
         """Join a friend's network with its name and 10-digit code."""
@@ -1012,6 +1045,8 @@ class Peer:
             if pw is None:  # "keep the saved password"
                 pw = self.config.get("password") or ""
             return self.join(m.get("server"), m.get("network"), pw, m.get("name"), alt=m.get("alt"))
+        if cmd == "retry_ports":
+            return self.retry_ports()
         if cmd == "join_code":
             return self.join_code(m.get("network"), m.get("code"), m.get("name"))
         if cmd == "host":
