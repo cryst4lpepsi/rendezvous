@@ -1,31 +1,39 @@
 #!/usr/bin/env python3
 """
-peer.py - one end of the tunnel, plus the live dashboard (http://localhost:8080).
+peer.py - one player's node: tunnels to every other player in the network,
+an optional virtual LAN adapter, and the live dashboard (http://localhost:8080).
 
-What happens, in order:
-  1. DISCOVERING  We register with the rendezvous server. The server replies with
-                  our PUBLIC endpoint (what our NAT turned us into) and, once the
-                  other peer is in the same room, the other peer's endpoints.
-  2. PUNCHING     Both peers fire small "punch" packets at each other's public
-                  (and LAN) endpoint at the same time. See _tick_punch() for why
-                  this opens a path through both NATs.
-  3. DIRECT       A packet from the peer arrived straight from the peer (not via
-                  the server). The hole is open; traffic flows peer-to-peer.
-  4. RELAY        Punching timed out. Traffic is wrapped and sent via the server,
-                  which forwards it. Slower, but works through any NAT.
+Each OTHER player gets its own Link with its own state machine:
+  1. DISCOVERING  We register with the rendezvous server. It replies with our
+                  PUBLIC endpoint (what our NAT turned us into), our virtual IP,
+                  and the endpoints of every other player in the network.
+  2. PUNCHING     We and that player fire small "punch" packets at each other's
+                  public (and LAN) endpoint at the same time. See _tick_punch()
+                  for why this opens a path through both NATs.
+  3. DIRECT       A packet arrived straight from the player (not via the
+                  server). The hole is open; traffic flows peer-to-peer.
+  4. RELAY        Punching timed out. Traffic for this player goes via the
+                  server, which forwards it. Slower, but works through any NAT.
   5. RECONNECTING We were DIRECT but keepalives stopped arriving. Traffic moves
-                  to the relay at once while we try to punch again; we end up
-                  back in DIRECT (path restored) or RELAY (fallback).
+                  to the relay at once while we punch again; we end up back in
+                  DIRECT (path restored) or RELAY (fallback).
+With 4 players you have 3 links, and each can be on a different path.
 
 Everything runs on ONE UDP socket. That matters: the NAT mapping the server
 observed belongs to this socket's port, so punch packets must leave from the
 very same socket or they would get a different public port.
+
+Wire format on that socket:
+  JSON (first byte "{")      control: register, punch, ping, chat, ...
+  0x01 | from_id | ip packet virtual-LAN packet sent directly to a peer
+  0x02 | to_id   | ip packet virtual-LAN packet sent to the server for relaying
+  0x03 | from_id | ip packet virtual-LAN packet relayed by the server
 """
 
 import argparse
 import asyncio
-import base64
 import collections
+import ipaddress
 import json
 import logging
 import secrets
@@ -50,13 +58,16 @@ RELAY = "RELAY"
 RECONNECTING = "RECONNECTING"
 
 REGISTER_INTERVAL = 2.0    # re-register: keeps our NAT mapping to the server alive
-KEEPALIVE_INTERVAL = 1.0   # ping the peer on the active path
+KEEPALIVE_INTERVAL = 1.0   # ping each peer on its active path
 DIRECT_DEAD_AFTER = 3.5    # no direct packet for this long => direct path is dead
 PUNCH_INTERVAL = 0.25      # one punch burst every 250 ms while punching
 SERVER_DEAD_AFTER = 6.0
 TICK = 0.1
 
-DASHBOARD_FILE = Path(__file__).with_name("dashboard.html")
+BIN_DIRECT, BIN_RELAY, BIN_RELAYED = 0x01, 0x02, 0x03
+
+RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+DASHBOARD_FILE = RESOURCE_DIR / "dashboard.html"
 
 
 def now():
@@ -74,7 +85,7 @@ def make_udp_socket(host, port):
 
 
 def resolve(hostport, default_port):
-    host, _, port = hostport.rpartition(":") if ":" in hostport else (hostport, "", default_port)
+    host, _, port = hostport.strip().rpartition(":") if ":" in hostport else (hostport.strip(), "", default_port)
     info = socket.getaddrinfo(host, int(port), socket.AF_INET, socket.SOCK_DGRAM)
     return info[0][4][:2]
 
@@ -108,104 +119,244 @@ class _Proto(asyncio.DatagramProtocol):
         log.debug("socket error (ignored): %s", exc)
 
 
-class Peer:
-    def __init__(self, args):
-        self.args = args
-        self.server_addr = resolve(args.server, 9000)
-        self.room = args.room
-        self.my_id = secrets.token_hex(3)
-        self.name = args.name or f"peer-{self.my_id}"
-        self.punch_timeout = args.punch_timeout
-        self.relay_retry = args.relay_retry
+class Link:
+    """Our connection to ONE other player, with its own state machine."""
+
+    def __init__(self, info, blackhole):
+        self.id = info["id"]
+        self.raw_id = bytes.fromhex(self.id)
+        self.name = info["name"]
+        self.vip = info.get("vip")
+        self.public = tuple(info["public"])
+        self.local = tuple(info["local"]) if info.get("local") else None
 
         self.state = DISCOVERING
         self.state_since = now()
-        self.peer = None           # {"id","name","public":(ip,port),"local":(ip,port)}
-        self.direct_addr = None    # the peer address that actually answered a punch
-        self.public_addr = None    # our public endpoint, as reported by the server
-        self.local_addr = None
-
-        # demo switches
-        self.forced_relay = False      # operator pinned the path to RELAY
-        self.blackhole = args.block_direct  # simulate a dead direct path: drop all non-server packets
+        self.direct_addr = None    # the address that actually answered a punch
+        self.forced_relay = False  # operator pinned this link to RELAY
+        self.blackhole = blackhole # simulate a dead direct path: drop all direct packets
 
         self.punch_round_start = 0.0
         self.punch_round_attempts = 0
         self.punch_attempts_total = 0
         self.last_punch = 0.0
-
         self.last_direct_rx = 0.0
         self.last_relay_rx = 0.0
-        self.last_server_rx = 0.0
-        self.server_ok = None
         self.relay_silent_warned = False
-        self.last_register = 0.0
         self.last_ping = 0.0
         self.ping_seq = 0
-        self.pending_pings = {}        # seq -> (sent_at, path)
+        self.pending_pings = {}    # seq -> (sent_at, path)
         self.rtt_ms = None
         self.rtt_path = None
         self.rtt_history = collections.deque(maxlen=60)  # (wall_time, rtt_ms, path)
-
         self.stats = collections.Counter()
-        self.events = collections.deque(maxlen=300)
+        self.last_data_pulse = {"in": 0.0, "out": 0.0}
+
+    @property
+    def vip_bytes(self):
+        return ipaddress.IPv4Address(self.vip).packed if self.vip else None
+
+    def path(self):
+        return "direct" if self.state == DIRECT else "relay"
+
+    def candidates(self):
+        # Every address we might reach this peer on: the last one that worked
+        # (fast path on reconnect), its public endpoint (different networks)
+        # and its LAN endpoint (same network, router may not support hairpinning).
+        out = []
+        for c in (self.direct_addr, self.public, self.local):
+            if c and c not in out:
+                out.append(c)
+        return out
+
+    def snapshot(self):
+        t = now()
+        return {
+            "id": self.id, "name": self.name, "vip": self.vip,
+            "state": self.state, "path": self.path(),
+            "in_state_s": round(t - self.state_since, 1),
+            "public": fmt(self.public), "local": fmt(self.local), "direct_addr": fmt(self.direct_addr),
+            "rtt_ms": self.rtt_ms, "rtt_path": self.rtt_path, "rtt_history": list(self.rtt_history),
+            "stats": dict(self.stats),
+            "punch": {"round": self.punch_round_attempts, "total": self.punch_attempts_total,
+                      "elapsed": round(t - self.punch_round_start, 2) if self.state in (PUNCHING, RECONNECTING) else None},
+            "direct_silence_s": round(t - self.last_direct_rx, 2) if self.last_direct_rx else None,
+            "forced_relay": self.forced_relay, "blackhole": self.blackhole,
+        }
+
+
+class Peer:
+    def __init__(self, args):
+        self.args = args
+        self.punch_timeout = args.punch_timeout
+        self.relay_retry = args.relay_retry
+        self.config_path = Path(args.config) if args.config else None
+        self.config = self._load_config()
+
+        self.joined = False
+        self.server_addr = None
+        self.network = None      # network name shown to the user
+        self.room = None         # what the server matches on: "network/password"
+        self.my_id = None
+        self.my_raw_id = None
+        self.name = args.name or self.config.get("name") or socket.gethostname()
+        self.public_addr = None  # our public endpoint, as reported by the server
+        self.local_addr = None
+        self.vip = None
+        self.prefix = None
+        self.links = {}          # peer id -> Link
+        self.vip_links = {}      # virtual ip (4 bytes) -> Link
+
+        self.last_server_rx = 0.0
+        self.server_ok = None
+        self.joined_at = 0.0
+        self.last_register = 0.0
+
+        self.vnet = None
+        self.vnet_status = "off"     # off | starting | up | error
+        self.vnet_detail = "virtual LAN disabled (demo/chat mode)"
+        self.vnet_stats = collections.Counter()
+
+        self.events = collections.deque(maxlen=400)
         self.chat = collections.deque(maxlen=100)
         self.event_seq = 0
-        self.seen_ctl = collections.deque(maxlen=50)
+        self.seen_ctl = collections.deque(maxlen=200)
         self.clients = set()           # one asyncio.Queue per open dashboard
+        self.had_client = False
+        self.no_clients_since = None
+        self.http_server = None        # uvicorn.Server, so the app can quit itself
 
+        self.loop = None
         self.transport = None
-        self.app_transport = None
-        self.app_reply_addr = None     # passthrough: where to send tunneled app packets
+        self.udp_port = None
         self._tasks = []
         self._last_push = 0.0
-        self.started = now()
+
+    # ================================================================ config
+    def _load_config(self):
+        if self.config_path and self.config_path.is_file():
+            try:
+                return json.loads(self.config_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                pass
+        return {}
+
+    def _save_config(self, **kw):
+        self.config.update(kw)
+        if self.config_path:
+            try:
+                self.config_path.parent.mkdir(parents=True, exist_ok=True)
+                self.config_path.write_text(json.dumps(self.config, indent=2), encoding="utf-8")
+            except OSError as e:
+                log.warning("could not save settings: %s", e)
 
     # ================================================================ startup
     async def start(self):
-        loop = asyncio.get_running_loop()
+        self.loop = asyncio.get_running_loop()
         sock = make_udp_socket(self.args.bind, self.args.udp_port)
-        self.transport, _ = await loop.create_datagram_endpoint(
+        self.transport, _ = await self.loop.create_datagram_endpoint(
             lambda: _Proto(self._on_datagram), sock=sock)
-        port = sock.getsockname()[1]
-        self.local_addr = (guess_lan_ip(self.server_addr), port)
-        self.event("info", f"{self.name} up: UDP socket bound to port {port}, "
-                           f"room '{self.room}', rendezvous {fmt(self.server_addr)}")
-
-        if self.args.app_listen or self.args.app_target:
-            await self._start_passthrough(loop)
-        if self.blackhole:
-            self.event("warn", "--block-direct: all direct packets will be dropped (relay only)")
-
-        self._register()
+        self.udp_port = sock.getsockname()[1]
+        self.event("info", f"{self.name} up: UDP tunnel socket on port {self.udp_port}")
+        if self.args.vlan:
+            await self._start_vnet()
         self._tasks.append(asyncio.create_task(self._ticker()))
 
     async def stop(self):
         for t in self._tasks:
             t.cancel()
+        if self.joined:
+            self.leave(quiet=True)
+        if self.vnet:
+            await self.loop.run_in_executor(None, self.vnet.close)
         if self.transport:
-            self._send_raw({"t": "bye", "room": self.room, "id": self.my_id}, self.server_addr)
             self.transport.close()
 
-    async def _start_passthrough(self, loop):
-        # Passthrough: a plain UDP app (game, iperf, netcat) talks to a local
-        # port; we carry its datagrams through the tunnel to the other side.
-        if self.args.app_listen:
-            sock = make_udp_socket("127.0.0.1", self.args.app_listen)
-            where = f"listening for app traffic on 127.0.0.1:{self.args.app_listen}"
-        else:
-            sock = make_udp_socket("0.0.0.0", 0)
-            self.app_reply_addr = resolve(self.args.app_target, 0)
-            where = f"delivering tunneled app traffic to {self.args.app_target}"
-        self.app_transport, _ = await loop.create_datagram_endpoint(
-            lambda: _Proto(self._on_app_datagram), sock=sock)
-        self.event("info", f"passthrough: {where}")
+    async def _start_vnet(self):
+        import vnet
+        self.vnet_status, self.vnet_detail = "starting", "creating virtual adapter..."
+        try:
+            self.vnet = await self.loop.run_in_executor(None, vnet.open_adapter)
+        except vnet.VnetError as e:
+            self.vnet_status, self.vnet_detail = "error", str(e)
+            self.event("bad", f"virtual LAN unavailable: {e}. Tunnel and chat still work.")
+            return
+        except Exception as e:  # unexpected driver/ctypes failure: keep the app usable
+            log.exception("virtual adapter failed")
+            self.vnet_status, self.vnet_detail = "error", f"{type(e).__name__}: {e}"
+            self.event("bad", f"virtual LAN unavailable: {e}")
+            return
+        self.vnet.start(lambda pkt: self.loop.call_soon_threadsafe(self._on_tun_packet, pkt))
+        self.vnet_detail = f"adapter '{self.vnet.name}' ready ({self.vnet.kind}), waiting for an address"
+        self.event("good", f"virtual adapter '{self.vnet.name}' created")
+
+    async def _assign_vip(self, vip, prefix):
+        if not self.vnet:
+            return
+        self.vnet_status, self.vnet_detail = "starting", f"assigning {vip}/{prefix}..."
+        self.push_state()
+        try:
+            await self.loop.run_in_executor(None, self.vnet.set_address, vip, prefix)
+        except Exception as e:
+            self.vnet_status, self.vnet_detail = "error", f"could not set address: {e}"
+            self.event("bad", self.vnet_detail)
+            return
+        if vip == self.vip:
+            self.vnet_status, self.vnet_detail = "up", f"adapter '{self.vnet.name}' is {vip}/{prefix}"
+            self.event("good", f"virtual LAN up: this PC is {vip} - games can reach the others "
+                               f"on their 10.x addresses and see LAN broadcasts")
+        self.push_state()
+
+    # ================================================================ join/leave
+    def join(self, server, network, password="", name=None, remember=True):
+        if self.joined:
+            self.leave(quiet=True)
+        network = (network or "").strip()
+        if not network:
+            self.event("warn", "enter a network name to join")
+            return False
+        try:
+            self.server_addr = resolve(server or "127.0.0.1:9000", 9000)
+        except (OSError, ValueError) as e:
+            self.event("bad", f"cannot resolve server '{server}': {e}")
+            return False
+        if name and name.strip():
+            self.name = name.strip()[:32]
+        self.network = network
+        self.room = f"{network}/{password}" if password else network
+        self.my_id = secrets.token_hex(3)
+        self.my_raw_id = bytes.fromhex(self.my_id)
+        self.local_addr = (guess_lan_ip(self.server_addr), self.udp_port)
+        self.public_addr = None
+        self.joined, self.joined_at = True, now()
+        self.server_ok = None
+        if remember:
+            self._save_config(server=server, network=network, password=password, name=self.name, autojoin=True)
+        self.event("info", f"joining network '{network}' via rendezvous {fmt(self.server_addr)} as {self.name}")
+        self._register()
+        self.push_state()
+        return True
+
+    def leave(self, quiet=False):
+        if not self.joined:
+            return
+        self._send_raw({"t": "bye", "room": self.room, "id": self.my_id}, self.server_addr)
+        for link in list(self.links.values()):
+            self._drop_link(link, "we left the network", quiet=True)
+        self.joined = False
+        if not quiet:
+            self._save_config(autojoin=False)
+            self.event("warn", f"left network '{self.network}'")
+        self.push_state()
 
     # ============================================================ event bus
-    def event(self, level, msg):
+    def event(self, level, msg, link=None):
         """Timestamped event: printed to the console AND pushed to dashboards."""
+        if link is not None:
+            msg = f"[{link.name}] {msg}"
         self.event_seq += 1
-        ev = {"type": "event", "id": self.event_seq, "ts": time.time(), "level": level, "msg": msg}
+        ev = {"type": "event", "id": self.event_seq, "ts": time.time(), "level": level, "msg": msg,
+              "peer": link.id if link else None}
         self.events.append(ev)
         log.info("%-5s %s", level.upper(), msg)
         self.broadcast(ev)
@@ -221,86 +372,73 @@ class Peer:
         self._last_push = now()
         self.broadcast(self.snapshot())
 
-    def active_path(self):
-        if self.peer is None:
-            return None
-        return "direct" if self.state == DIRECT else "relay"
-
     def snapshot(self):
-        t = now()
-        p = self.peer
+        tot = collections.Counter()
+        for l in self.links.values():
+            tot.update(l.stats)
         return {
             "type": "state",
-            "state": self.state,
-            "path": self.active_path(),
-            "in_state_s": round(t - self.state_since, 1),
-            "room": self.room,
-            "me": {"id": self.my_id, "name": self.name,
-                   "public": fmt(self.public_addr), "local": fmt(self.local_addr)},
-            "peer": None if p is None else {"id": p["id"], "name": p["name"],
-                                            "public": fmt(p["public"]), "local": fmt(p["local"])},
-            "direct_addr": fmt(self.direct_addr),
+            "joined": self.joined,
+            "network": self.network,
             "server": fmt(self.server_addr),
             "server_ok": self.server_ok,
-            "rtt_ms": self.rtt_ms,
-            "rtt_path": self.rtt_path,
-            "rtt_history": list(self.rtt_history),
-            "stats": dict(self.stats),
-            "punch": {"round": self.punch_round_attempts, "total": self.punch_attempts_total,
-                      "elapsed": round(t - self.punch_round_start, 2) if self.state in (PUNCHING, RECONNECTING) else None,
-                      "timeout": self.punch_timeout},
-            "direct_silence_s": round(t - self.last_direct_rx, 2) if self.last_direct_rx else None,
+            "me": {"id": self.my_id, "name": self.name, "vip": self.vip,
+                   "public": fmt(self.public_addr), "local": fmt(self.local_addr)},
+            "vnet": {"enabled": bool(self.args.vlan), "status": self.vnet_status, "detail": self.vnet_detail,
+                     "stats": dict(self.vnet_stats)},
+            "peers": [l.snapshot() for l in self.links.values()],
+            "totals": dict(tot),
+            "punch_timeout": self.punch_timeout,
             "dead_after": DIRECT_DEAD_AFTER,
-            "forced_relay": self.forced_relay,
-            "blackhole": self.blackhole,
+            "saved": {k: self.config.get(k, "") for k in ("server", "network", "name")}
+                     | {"has_password": bool(self.config.get("password"))},
+            "app_mode": bool(self.args.app_mode),
         }
 
     # ========================================================= state machine
-    def set_state(self, new, reason, level="info"):
-        if new == self.state:
+    def set_state(self, link, new, reason, level="info"):
+        if new == link.state:
             return
-        old, self.state, self.state_since = self.state, new, now()
+        old, link.state, link.state_since = link.state, new, now()
         if new in (PUNCHING, RECONNECTING):
-            self.punch_round_start = now()
-            self.punch_round_attempts = 0
-            self.last_punch = 0.0
-        self.relay_silent_warned = False
+            link.punch_round_start = now()
+            link.punch_round_attempts = 0
+            link.last_punch = 0.0
+        link.relay_silent_warned = False
         if new == DIRECT:
-            self.last_direct_rx = now()
-        self.event(level, f"{old} -> {new}: {reason}")
-        self.broadcast({"type": "transition", "from": old, "to": new})
+            link.last_direct_rx = now()
+        self.event(level, f"{old} -> {new}: {reason}", link)
+        self.broadcast({"type": "transition", "peer": link.id, "name": link.name, "from": old, "to": new})
         self.push_state()
 
-    def start_punching(self, reason, notify=True, reconnect=False):
-        """Begin a punch round. Hole punching only works if BOTH sides send at
-        roughly the same time, so unless the peer asked us to do this, we ask it
-        to punch too (via the relay, which always works)."""
-        if self.peer is None:
-            return
+    def start_punching(self, link, reason, notify=True, reconnect=False):
+        """Begin a punch round with one peer. Hole punching only works if BOTH
+        sides send at roughly the same time, so unless the peer asked us to do
+        this, we ask it to punch too (via the relay, which always works)."""
         target = RECONNECTING if reconnect else PUNCHING
-        if self.state == target:
-            self.punch_round_start, self.punch_round_attempts = now(), 0
+        if link.state == target:
+            link.punch_round_start, link.punch_round_attempts = now(), 0
         else:
-            self.set_state(target, reason, "warn" if reconnect else "info")
+            self.set_state(link, target, reason, "warn" if reconnect else "info")
         if notify:
-            self._send_ctl("punch_now")
+            self._send_ctl(link, "punch_now")
 
-    def _direct_evidence(self, addr, why):
-        """A valid packet from the peer arrived over the DIRECT path."""
-        if self.forced_relay:
+    def _direct_evidence(self, link, addr, why):
+        """A valid packet from this peer arrived over the DIRECT path."""
+        if link.forced_relay:
             return
-        if self.state in (PUNCHING, RECONNECTING, RELAY):
+        if link.state in (PUNCHING, RECONNECTING, RELAY):
             # Peer-reflexive address: we lock onto whatever address the packet
             # actually came from, which may differ from what the server told us
             # (e.g. the peer is on our LAN, or its NAT chose another port).
-            self.direct_addr = addr
-            restored = self.state == RECONNECTING
-            self.set_state(DIRECT, f"{why} from {fmt(addr)} - "
-                                   f"{'direct path restored' if restored else 'hole punched, traffic now peer-to-peer'}",
+            link.direct_addr = addr
+            restored = link.state == RECONNECTING
+            self.set_state(link, DIRECT, f"{why} from {fmt(addr)} - "
+                                         f"{'direct path restored' if restored else 'hole punched, traffic now peer-to-peer'}",
                            "good")
-        elif self.state == DIRECT and addr != self.direct_addr:
-            self.event("info", f"peer's direct address moved {fmt(self.direct_addr)} -> {fmt(addr)}")
-            self.direct_addr = addr
+        elif link.state == DIRECT and addr != link.direct_addr:
+            self.event("info", f"direct address moved {fmt(link.direct_addr)} -> {fmt(addr)}", link)
+            link.direct_addr = addr
 
     async def _ticker(self):
         while True:
@@ -312,54 +450,57 @@ class Peer:
 
     def _tick(self):
         t = now()
-        if t - self.last_register >= REGISTER_INTERVAL:
-            self._register()
+        self._tick_app_lifetime(t)
+        if self.joined:
+            if t - self.last_register >= REGISTER_INTERVAL:
+                self._register()
+            self._tick_server(t)
+            for link in list(self.links.values()):
+                self._tick_link(link, t)
+        if t - self._last_push >= 0.25:
+            self.push_state()
 
-        # Is the rendezvous server still answering?
-        server_ok = bool(self.last_server_rx) and (t - self.last_server_rx) < SERVER_DEAD_AFTER
+    def _tick_server(self, t):
+        server_ok = bool(self.last_server_rx) and (t - self.last_server_rx) < SERVER_DEAD_AFTER \
+            and self.last_server_rx >= self.joined_at
         if server_ok and self.server_ok is not True:
             if self.server_ok is False:
                 self.event("good", "rendezvous server reachable again")
             self.server_ok = True
         elif not server_ok and self.server_ok is not False:
-            if self.server_ok is True or t - self.started > SERVER_DEAD_AFTER:
-                self.event("bad", f"rendezvous server {fmt(self.server_addr)} not responding")
+            if self.server_ok is True or t - self.joined_at > SERVER_DEAD_AFTER:
+                self.event("bad", f"rendezvous server {fmt(self.server_addr)} not responding "
+                                  f"(check the address and that UDP {self.server_addr[1]} is open)")
                 self.server_ok = False
 
-        if self.peer is not None:
-            if self.state in (PUNCHING, RECONNECTING):
-                self._tick_punch(t)
-            elif self.state == DIRECT:
-                # Keepalive watchdog: the peer pings us every second over the
-                # direct path. Silence for DIRECT_DEAD_AFTER means the NAT
-                # mapping expired, a router rebooted, wifi changed, ... Move
-                # traffic to the relay immediately and try to punch again.
-                silence = t - self.last_direct_rx
-                if silence > DIRECT_DEAD_AFTER:
-                    self.start_punching(f"keepalive lost: no direct packet for {silence:.1f}s, "
-                                        f"traffic moved to relay while re-punching", reconnect=True)
-            elif self.state == RELAY:
-                if (not self.forced_relay and self.relay_retry > 0
-                        and t - self.state_since > self.relay_retry):
-                    self.start_punching(f"periodic retry: {self.relay_retry:.0f}s on relay, trying direct again")
-                # Measure relay silence from when we switched, not from the last
-                # (possibly ancient) relayed packet.
-                if (t - max(self.last_relay_rx, self.state_since) > SERVER_DEAD_AFTER
-                        and not self.relay_silent_warned):
-                    self.relay_silent_warned = True
-                    self.event("bad", "relay path silent: no packet from peer via server")
+    def _tick_link(self, link, t):
+        if link.state in (PUNCHING, RECONNECTING):
+            self._tick_punch(link, t)
+        elif link.state == DIRECT:
+            # Keepalive watchdog: the peer pings us every second over the
+            # direct path. Silence for DIRECT_DEAD_AFTER means the NAT mapping
+            # expired, a router rebooted, wifi changed, ... Move traffic to the
+            # relay immediately and try to punch again.
+            silence = t - link.last_direct_rx
+            if silence > DIRECT_DEAD_AFTER:
+                self.start_punching(link, f"keepalive lost: no direct packet for {silence:.1f}s, "
+                                          f"traffic moved to relay while re-punching", reconnect=True)
+        elif link.state == RELAY:
+            if not link.forced_relay and self.relay_retry > 0 and t - link.state_since > self.relay_retry:
+                self.start_punching(link, f"periodic retry: {self.relay_retry:.0f}s on relay, trying direct again")
+            # Measure relay silence from when we switched, not from the last
+            # (possibly ancient) relayed packet.
+            if t - max(link.last_relay_rx, link.state_since) > SERVER_DEAD_AFTER and not link.relay_silent_warned:
+                link.relay_silent_warned = True
+                self.event("bad", "relay path silent: no packet from this peer via server", link)
 
-            if t - self.last_ping >= KEEPALIVE_INTERVAL:
-                self._send_ping()
-
-        for seq, (sent, _) in list(self.pending_pings.items()):
+        if t - link.last_ping >= KEEPALIVE_INTERVAL:
+            self._send_ping(link)
+        for seq, (sent, _) in list(link.pending_pings.items()):
             if t - sent > 5:
-                del self.pending_pings[seq]
+                del link.pending_pings[seq]
 
-        if t - self._last_push >= 0.25:
-            self.push_state()
-
-    def _tick_punch(self, t):
+    def _tick_punch(self, link, t):
         """
         UDP HOLE PUNCHING, the core trick.
 
@@ -379,32 +520,46 @@ class Peer:
         peer too). It fails for symmetric NATs, which pick a new public port
         for every destination; then we time out and use the relay.
 
-        We punch every candidate: the public endpoint (different networks),
-        the LAN endpoint (same network, router may not support hairpinning),
-        and the last address that worked (fast path on reconnect).
+        With several players this runs independently for every pair.
         """
-        if t - self.last_punch >= PUNCH_INTERVAL:
-            self.last_punch = t
-            self.punch_round_attempts += 1
-            self.punch_attempts_total += 1
-            cands = []
-            for c in (self.direct_addr, self.peer["public"], self.peer["local"]):
-                if c and c not in cands:
-                    cands.append(c)
-            msg = self._pmsg("punch", n=self.punch_round_attempts)
+        if t - link.last_punch >= PUNCH_INTERVAL:
+            link.last_punch = t
+            link.punch_round_attempts += 1
+            link.punch_attempts_total += 1
+            cands = link.candidates()
+            msg = self._pmsg("punch", n=link.punch_round_attempts)
             for c in cands:
-                self._send_direct(msg, c, "punch")
-            self.event("info", f"punch attempt {self.punch_round_attempts} -> "
+                self._send_direct(link, msg, c, "punch")
+            self.event("info", f"punch attempt {link.punch_round_attempts} -> "
                                f"{', '.join(fmt(c) for c in cands)}"
-                               f"{' (dropped: direct path blocked)' if self.blackhole else ''}")
-            self.broadcast({"type": "punch", "n": self.punch_round_attempts})
-        if t - self.punch_round_start > self.punch_timeout:
-            self.set_state(RELAY, f"hole punching timed out after {self.punch_round_attempts} attempts "
-                                  f"({self.punch_timeout:.0f}s) - falling back to relay via server", "warn")
+                               f"{' (dropped: direct path blocked)' if link.blackhole else ''}", link)
+            self.broadcast({"type": "punch", "peer": link.id, "n": link.punch_round_attempts})
+        if t - link.punch_round_start > self.punch_timeout:
+            self.set_state(link, RELAY, f"hole punching timed out after {link.punch_round_attempts} attempts "
+                                        f"({self.punch_timeout:.0f}s) - falling back to relay via server", "warn")
+
+    def _tick_app_lifetime(self, t):
+        # In app mode, closing the window means quitting: once a dashboard has
+        # connected, exit when none has been open for a few seconds (a page
+        # reload reconnects well within that).
+        if not self.args.exit_when_closed or not self.had_client:
+            return
+        if self.clients:
+            self.no_clients_since = None
+        elif self.no_clients_since is None:
+            self.no_clients_since = t
+        elif t - self.no_clients_since > 6:
+            log.info("app window closed, shutting down")
+            self.quit()
+
+    def quit(self):
+        if self.http_server:
+            self.http_server.should_exit = True
 
     # ================================================================ sending
-    def _send_raw(self, msg, addr):
-        data = json.dumps(msg, separators=(",", ":")).encode()
+    def _send_raw(self, data, addr):
+        if isinstance(data, dict):
+            data = json.dumps(data, separators=(",", ":")).encode()
         try:
             self.transport.sendto(data, addr)
         except OSError as e:
@@ -419,86 +574,185 @@ class Peer:
     def _register(self):
         self.last_register = now()
         self._send_raw({"t": "register", "room": self.room, "id": self.my_id, "name": self.name,
-                        "local": list(self.local_addr)}, self.server_addr)
+                        "local": list(self.local_addr), "want_ip": self.config.get("vip")}, self.server_addr)
         log.debug("-> server: register")
 
-    def _send_direct(self, msg, addr, what=None):
-        if self.blackhole:
-            log.debug("BLACKHOLE drop outbound %s to %s", msg["t"], fmt(addr))
+    def _send_direct(self, link, msg, addr, what=None):
+        if link.blackhole:
+            log.debug("BLACKHOLE drop outbound %s to %s", what or "packet", fmt(addr))
             return
         n = self._send_raw(msg, addr)
-        self.stats["tx_bytes"] += n
-        self.stats["tx_direct_bytes"] += n
-        self.stats["tx_packets"] += 1
-        log.debug("-> direct %s: %s", fmt(addr), what or msg["t"])
+        link.stats["tx_bytes"] += n
+        link.stats["tx_direct_bytes"] += n
+        link.stats["tx_packets"] += 1
+        log.debug("-> direct %s %s: %s", link.name, fmt(addr), what or (msg.get("t") if isinstance(msg, dict) else "data"))
 
-    def _send_relay(self, msg):
-        n = self._send_raw({"t": "relay", "room": self.room, "from": self.my_id, "inner": msg},
-                           self.server_addr)
-        self.stats["tx_bytes"] += n
-        self.stats["tx_relay_bytes"] += n
-        self.stats["tx_packets"] += 1
-        log.debug("-> relay via server: %s", msg["t"])
+    def _send_relay(self, link, msg):
+        if isinstance(msg, dict):
+            data = {"t": "relay", "room": self.room, "from": self.my_id, "to": link.id, "inner": msg}
+        else:
+            data = bytes([BIN_RELAY]) + link.raw_id + msg
+        n = self._send_raw(data, self.server_addr)
+        link.stats["tx_bytes"] += n
+        link.stats["tx_relay_bytes"] += n
+        link.stats["tx_packets"] += 1
+        log.debug("-> relay to %s: %s", link.name, msg.get("t") if isinstance(msg, dict) else "data")
 
-    def _send_peer(self, msg):
-        """Send on whatever path is active right now. Returns the path used."""
-        path = self.active_path()
-        if path == "direct":
-            self._send_direct(msg, self.direct_addr)
-        elif path == "relay":
-            self._send_relay(msg)
-        return path
+    def _send_peer(self, link, msg):
+        """Send on whatever path is active for this peer. Returns the path used."""
+        if link.state == DIRECT:
+            self._send_direct(link, msg, link.direct_addr)
+            return "direct"
+        self._send_relay(link, msg)
+        return "relay"
 
-    def _send_ping(self):
-        self.last_ping = now()
-        self.ping_seq += 1
-        path = self._send_peer(self._pmsg("ping", seq=self.ping_seq))
-        self.pending_pings[self.ping_seq] = (now(), path)
-        self.broadcast({"type": "pulse", "path": path, "dir": "out"})
+    def _send_ping(self, link):
+        link.last_ping = now()
+        link.ping_seq += 1
+        path = self._send_peer(link, self._pmsg("ping", seq=link.ping_seq))
+        link.pending_pings[link.ping_seq] = (now(), path)
+        self.broadcast({"type": "pulse", "peer": link.id, "path": path, "dir": "out"})
 
-    def _send_ctl(self, op):
+    def _send_ctl(self, link, op):
         # Control messages go via the relay (always available) AND direct if we
         # have it; the receiver de-duplicates by id.
         msg = self._pmsg("ctl", op=op, cid=secrets.token_hex(4))
-        self._send_relay(msg)
-        if self.state == DIRECT and self.direct_addr:
-            self._send_direct(msg, self.direct_addr)
+        self._send_relay(link, msg)
+        if link.state == DIRECT and link.direct_addr:
+            self._send_direct(link, msg, link.direct_addr)
+
+    # ============================================================ virtual LAN
+    def _on_tun_packet(self, pkt):
+        """
+        The OS sent an IP packet into our virtual adapter. Decide which
+        player(s) it is for, by its destination address:
+          10.77.0.x of a player        -> that player only
+          broadcast / multicast        -> every player (this is how LAN game
+                                          discovery reaches the others)
+          anything else                -> drop
+        """
+        if len(pkt) < 20 or pkt[0] >> 4 != 4:
+            self.vnet_stats["dropped_non_ipv4"] += 1  # IPv6 isn't routed on the virtual LAN
+            return
+        if pkt[9] == 2:
+            return  # IGMP membership chatter: meaningless across the tunnel
+        dst = pkt[16:20]
+        link = self.vip_links.get(dst)
+        if link is not None:
+            self._send_vlan(link, pkt)
+        elif dst == b"\xff\xff\xff\xff" or dst == self._bcast or 224 <= dst[0] <= 239:
+            self.vnet_stats["tx_broadcast"] += 1
+            for link in list(self.links.values()):
+                self._send_vlan(link, pkt)
+        else:
+            self.vnet_stats["dropped_no_route"] += 1
+
+    @property
+    def _bcast(self):
+        if not self.vip:
+            return None
+        return ipaddress.ip_network(f"{self.vip}/{self.prefix}", strict=False).broadcast_address.packed
+
+    def _send_vlan(self, link, pkt):
+        if link.state == DIRECT and link.direct_addr:
+            self._send_direct(link, bytes([BIN_DIRECT]) + self.my_raw_id + pkt, link.direct_addr)
+            path = "direct"
+        else:
+            self._send_relay(link, pkt)
+            path = "relay"
+        link.stats["vlan_tx_packets"] += 1
+        link.stats["vlan_tx_bytes"] += len(pkt)
+        self._data_pulse(link, path, "out")
+
+    def _deliver_vlan(self, link, pkt, path):
+        # Anti-spoofing: a player may only send packets from its own virtual IP.
+        if len(pkt) < 20 or pkt[12:16] != link.vip_bytes:
+            log.debug("drop vlan packet from %s: wrong source address", link.name)
+            return
+        link.stats["vlan_rx_packets"] += 1
+        link.stats["vlan_rx_bytes"] += len(pkt)
+        self._data_pulse(link, path, "in")
+        if self.vnet and self.vnet_status == "up":
+            self.vnet.write(pkt)
+
+    def _data_pulse(self, link, path, direction):
+        t = now()
+        if t - link.last_data_pulse[direction] > 0.15:  # don't flood the dashboard
+            link.last_data_pulse[direction] = t
+            self.broadcast({"type": "pulse", "peer": link.id, "path": path, "dir": direction, "data": True})
 
     # ============================================================== receiving
     def _on_datagram(self, data, addr):
-        try:
-            msg = json.loads(data)
-            if not isinstance(msg, dict):
-                raise ValueError
-        except ValueError:
-            log.debug("drop: garbage datagram from %s", fmt(addr))
+        if not data or not self.joined:
             return
-
+        kind = data[0]
         if addr == self.server_addr:
             self.last_server_rx = now()
+            if kind == BIN_RELAYED:
+                link = self._link_by_raw(data[1:4])
+                if link:
+                    self._count_rx(link, len(data), "relay")
+                    link.last_relay_rx = now()
+                    self._deliver_vlan(link, data[4:], "relay")
+                return
+            msg = self._parse(data, addr)
+            if msg is None:
+                return
             if msg.get("t") == "relayed":
+                link = self.links.get(msg.get("from"))
                 inner = msg.get("inner")
-                if isinstance(inner, dict):
-                    self.stats["rx_bytes"] += len(data)
-                    self.stats["rx_relay_bytes"] += len(data)
-                    self.stats["rx_packets"] += 1
-                    self.last_relay_rx = now()
-                    if self.relay_silent_warned and self.state == RELAY:
-                        self.relay_silent_warned = False
-                        self.event("good", "relay path alive again")
-                    self._on_peer_msg(inner, "relay", None)
+                if link and isinstance(inner, dict):
+                    self._count_rx(link, len(data), "relay")
+                    link.last_relay_rx = now()
+                    self._on_peer_msg(link, inner, "relay", None)
             else:
                 self._on_server_msg(msg)
             return
 
-        # Anything not from the server came over the direct path.
-        if self.blackhole:
+        # Anything not from the server came over a direct path.
+        if kind == BIN_DIRECT:
+            link = self._link_by_raw(data[1:4])
+            # Only accept data from an address we punched with this peer.
+            if not link or link.blackhole or addr not in link.candidates():
+                log.debug("drop direct vlan packet from %s", fmt(addr))
+                return
+            self._count_rx(link, len(data), "direct")
+            link.last_direct_rx = now()
+            self._deliver_vlan(link, data[4:], "direct")
+            return
+        msg = self._parse(data, addr)
+        if msg is None:
+            return
+        link = self.links.get(msg.get("from"))
+        if link is None or msg.get("room") != self.room:
+            log.debug("drop %s from %s: unknown sender or wrong room code", msg.get("t"), fmt(addr))
+            return
+        if link.blackhole:
             log.debug("BLACKHOLE drop inbound %s from %s", msg.get("t"), fmt(addr))
             return
-        self.stats["rx_bytes"] += len(data)
-        self.stats["rx_direct_bytes"] += len(data)
-        self.stats["rx_packets"] += 1
-        self._on_peer_msg(msg, "direct", addr)
+        self._count_rx(link, len(data), "direct")
+        self._on_peer_msg(link, msg, "direct", addr)
+
+    def _parse(self, data, addr):
+        try:
+            msg = json.loads(data)
+            if isinstance(msg, dict):
+                return msg
+        except ValueError:
+            pass
+        log.debug("drop: garbage datagram from %s", fmt(addr))
+        return None
+
+    def _link_by_raw(self, raw):
+        for link in self.links.values():
+            if link.raw_id == raw:
+                return link
+        return None
+
+    def _count_rx(self, link, n, path):
+        link.stats["rx_bytes"] += n
+        link.stats[f"rx_{path}_bytes"] += n
+        link.stats["rx_packets"] += 1
 
     def _on_server_msg(self, msg):
         t = msg.get("t")
@@ -509,175 +763,178 @@ class Peer:
                            f"registered with rendezvous; our public endpoint is {fmt(pub)}"
                            + ("" if pub[0] != self.local_addr[0] else " (same as local: no NAT in between)"))
                 self.public_addr = pub
-                if self.peer is None:
-                    self.event("info", f"waiting for a peer to join room '{self.room}'...")
+                if not self.links:
+                    self.event("info", f"waiting for other players to join '{self.network}'...")
+            vip, prefix = msg.get("vip"), msg.get("prefix", 24)
+            if vip and vip != self.vip:
+                self.vip, self.prefix = vip, prefix
+                self._save_config(vip=vip)
+                self.event("good", f"virtual IP assigned: {vip}")
+                asyncio.ensure_future(self._assign_vip(vip, prefix))
         elif t == "peer":
-            pub = tuple(msg["public"])
-            loc = tuple(msg["local"]) if msg.get("local") else None
-            if self.peer is None or self.peer["id"] != msg["id"]:
-                if self.peer is not None:
-                    self.event("warn", f"peer changed: {self.peer['name']} replaced by {msg['name']}")
-                self.peer = {"id": msg["id"], "name": msg["name"], "public": pub, "local": loc}
-                self.direct_addr = None
-                self.last_direct_rx = 0.0
-                self.forced_relay = False
-                self.event("good", f"peer discovered: {msg['name']} public={fmt(pub)} local={fmt(loc)}")
-                self.start_punching("got peer's endpoints from rendezvous, both sides punch now")
-            elif self.peer["public"] != pub or self.peer["local"] != loc:
-                self.event("warn", f"peer endpoint changed {fmt(self.peer['public'])} -> {fmt(pub)}")
-                self.peer.update(public=pub, local=loc)
-                if self.state != DIRECT and not self.forced_relay:
-                    self.start_punching("peer endpoint changed")
+            link = self.links.get(msg["id"])
+            if link is None:
+                link = Link(msg, blackhole=self.args.block_direct)
+                self.links[link.id] = link
+                if link.vip:
+                    self.vip_links[link.vip_bytes] = link
+                self.event("good", f"player joined: public={fmt(link.public)} local={fmt(link.local)} "
+                                   f"virtual IP={link.vip}", link)
+                self.start_punching(link, "got endpoints from rendezvous, both sides punch now")
+            else:
+                pub = tuple(msg["public"])
+                loc = tuple(msg["local"]) if msg.get("local") else None
+                if link.public != pub or link.local != loc:
+                    self.event("warn", f"endpoint changed {fmt(link.public)} -> {fmt(pub)}", link)
+                    link.public, link.local = pub, loc
+                    if link.state != DIRECT and not link.forced_relay:
+                        self.start_punching(link, "peer endpoint changed")
         elif t == "peer_left":
-            if self.peer and self.peer["id"] == msg.get("id"):
-                self._peer_gone("server says peer left")
+            link = self.links.get(msg.get("id"))
+            if link:
+                self._drop_link(link, "left the network")
         elif t == "error":
             self.event("bad", f"server error: {msg.get('reason')}")
         else:
             log.debug("drop: unknown server message %r", t)
 
-    def _peer_gone(self, why):
-        name = self.peer["name"]
-        self.peer = None
-        self.direct_addr = None
-        self.rtt_ms = None
-        self.pending_pings.clear()
-        self.set_state(DISCOVERING, f"{name} gone ({why}); waiting for a peer", "bad")
+    def _drop_link(self, link, why, quiet=False):
+        self.links.pop(link.id, None)
+        if link.vip:
+            self.vip_links.pop(link.vip_bytes, None)
+        if not quiet:
+            self.event("bad", f"{link.state} -> gone: {why}", link)
+            self.broadcast({"type": "transition", "peer": link.id, "name": link.name, "from": link.state, "to": "GONE"})
+        self.push_state()
 
-    def _on_peer_msg(self, msg, path, addr):
-        if msg.get("room") != self.room:
-            log.debug("drop %s from %s: wrong room code", msg.get("t"), fmt(addr) if addr else "relay")
-            return
-        if self.peer is None or msg.get("from") != self.peer["id"]:
-            log.debug("drop %s via %s: sender %r is not our peer", msg.get("t"), path, msg.get("from"))
+    def _on_peer_msg(self, link, msg, path, addr):
+        if msg.get("room") != self.room or msg.get("from") != link.id:
+            log.debug("drop %s via %s: wrong room code or sender", msg.get("t"), path)
             return
         t = msg.get("t")
         if path == "direct":
-            self.last_direct_rx = now()
-        log.debug("<- %s %s: %s", path, fmt(addr) if addr else "server", t)
+            link.last_direct_rx = now()
+        log.debug("<- %s %s %s: %s", path, link.name, fmt(addr) if addr else "server", t)
 
         if t == "punch":
-            if self.forced_relay:
+            if link.forced_relay:
                 log.debug("ignoring punch: relay is forced")
                 return
             # Answer to the exact address the punch came from: that is the hole.
-            self._send_direct(self._pmsg("punch_ack", n=msg.get("n")), addr, "punch_ack")
-            self._direct_evidence(addr, f"received punch #{msg.get('n')}")
+            self._send_direct(link, self._pmsg("punch_ack", n=msg.get("n")), addr, "punch_ack")
+            self._direct_evidence(link, addr, f"received punch #{msg.get('n')}")
         elif t == "punch_ack":
-            self._direct_evidence(addr, f"punch #{msg.get('n')} answered")
+            self._direct_evidence(link, addr, f"punch #{msg.get('n')} answered")
         elif t == "ping":
             # Reply on the same path the ping came in on, so RTT measures that path.
             pong = self._pmsg("pong", seq=msg.get("seq"))
             if path == "direct":
-                self._send_direct(pong, addr)
-                self._direct_evidence(addr, "keepalive")
+                self._send_direct(link, pong, addr)
+                self._direct_evidence(link, addr, "keepalive")
             else:
-                self._send_relay(pong)
+                self._send_relay(link, pong)
         elif t == "pong":
-            sent = self.pending_pings.pop(msg.get("seq"), None)
+            sent = link.pending_pings.pop(msg.get("seq"), None)
             if sent:
-                self.rtt_ms = round((now() - sent[0]) * 1000, 2)
-                self.rtt_path = path
-                self.rtt_history.append((round(time.time(), 2), self.rtt_ms, path))
-                self.broadcast({"type": "pulse", "path": path, "dir": "in"})
+                link.rtt_ms = round((now() - sent[0]) * 1000, 2)
+                link.rtt_path = path
+                link.rtt_history.append((round(time.time(), 2), link.rtt_ms, path))
+                self.broadcast({"type": "pulse", "peer": link.id, "path": path, "dir": "in"})
             if path == "direct":
-                self._direct_evidence(addr, "keepalive reply")
+                self._direct_evidence(link, addr, "keepalive reply")
         elif t == "chat":
-            entry = {"type": "chat", "ts": time.time(), "who": self.peer["name"], "mine": False,
+            entry = {"type": "chat", "ts": time.time(), "who": link.name, "mine": False,
                      "text": str(msg.get("text", ""))[:2000], "path": path}
             self.chat.append(entry)
             self.broadcast(entry)
-            self.broadcast({"type": "pulse", "path": path, "dir": "in", "big": True})
-            log.info("CHAT  <%s via %s> %s", self.peer["name"], path.upper(), entry["text"])
-        elif t == "app":
-            self._deliver_app(msg, path)
+            self.broadcast({"type": "pulse", "peer": link.id, "path": path, "dir": "in", "big": True})
+            log.info("CHAT  <%s via %s> %s", link.name, path.upper(), entry["text"])
         elif t == "ctl":
             if msg.get("cid") in self.seen_ctl:
                 return
             self.seen_ctl.append(msg.get("cid"))
-            self._on_ctl(msg.get("op"))
+            self._on_ctl(link, msg.get("op"))
         else:
             log.debug("drop: unknown peer message %r", t)
 
-    def _on_ctl(self, op):
-        name = self.peer["name"]
+    def _on_ctl(self, link, op):
         if op == "force_relay":
-            self.forced_relay = True
-            self.set_state(RELAY, f"{name} forced relay mode", "warn")
+            link.forced_relay = True
+            self.set_state(link, RELAY, "peer forced relay mode", "warn")
         elif op == "repunch":
-            self.forced_relay = False
-            self.blackhole = False
-            self.start_punching(f"{name} requested a re-punch", notify=False)
+            link.forced_relay = False
+            link.blackhole = False
+            self.start_punching(link, "peer requested a re-punch", notify=False)
         elif op == "punch_now":
             # The peer started a punch round; join it so both NATs open together.
-            if self.forced_relay:
+            if link.forced_relay:
                 return
-            if self.state == DIRECT:
-                self.start_punching(f"{name} lost the direct path, re-punching together",
+            if link.state == DIRECT:
+                self.start_punching(link, "peer lost the direct path, re-punching together",
                                     notify=False, reconnect=True)
-            elif self.state == RELAY:
-                self.start_punching(f"{name} is retrying direct, punching together", notify=False)
+            elif link.state == RELAY:
+                self.start_punching(link, "peer is retrying direct, punching together", notify=False)
 
     # ===================================================== operator commands
-    def command(self, cmd, text=None):
+    def command(self, m):
+        cmd = m.get("cmd")
+        if cmd == "join":
+            return self.join(m.get("server"), m.get("network"), m.get("password") or "", m.get("name"))
+        if cmd == "rejoin":
+            c = self.config
+            return self.join(c.get("server"), c.get("network"), c.get("password") or "", c.get("name"))
+        if cmd == "leave":
+            return self.leave()
+        if cmd == "quit":
+            self.event("warn", "quitting")
+            return self.quit()
         if cmd == "chat":
-            return self.send_chat(text or "")
-        if self.peer is None:
-            self.event("warn", f"'{cmd}' ignored: no peer connected yet")
+            return self.send_chat(m.get("text") or "")
+        targets = [self.links[m["peer"]]] if m.get("peer") in self.links else list(self.links.values())
+        if not targets:
+            self.event("warn", f"'{cmd}' ignored: no other players connected")
             return
-        if cmd == "force_relay":
-            self.event("warn", "operator: FORCE RELAY")
-            self._send_ctl("force_relay")
-            self.forced_relay = True
-            self.set_state(RELAY, "forced by operator", "warn")
-        elif cmd == "repunch":
-            self.event("info", "operator: FORCE RE-PUNCH (clears forced relay / dropped path on both sides)")
-            self.forced_relay = False
-            self.blackhole = False
-            self._send_ctl("repunch")
-            self.start_punching("operator requested re-punch", notify=False)
-        elif cmd == "drop_direct":
-            # We do NOT change state here on purpose: the keepalive watchdog has
-            # to notice the silence by itself, exactly like a real failure.
-            self.blackhole = True
-            self.event("bad", "operator: DROP DIRECT PATH - all direct packets now discarded "
-                              f"(watchdog should notice within {DIRECT_DEAD_AFTER}s)")
-            self.push_state()
-        else:
-            self.event("warn", f"unknown command {cmd!r}")
+        for link in targets:
+            if cmd == "force_relay":
+                self.event("warn", "operator: FORCE RELAY", link)
+                self._send_ctl(link, "force_relay")
+                link.forced_relay = True
+                self.set_state(link, RELAY, "forced by operator", "warn")
+            elif cmd == "repunch":
+                self.event("info", "operator: FORCE RE-PUNCH (clears forced relay / dropped path on both sides)", link)
+                link.forced_relay = False
+                link.blackhole = False
+                self._send_ctl(link, "repunch")
+                self.start_punching(link, "operator requested re-punch", notify=False)
+            elif cmd == "drop_direct":
+                # We do NOT change state here on purpose: the keepalive watchdog
+                # has to notice the silence by itself, exactly like a real failure.
+                link.blackhole = True
+                self.event("bad", "operator: DROP DIRECT PATH - all direct packets now discarded "
+                                  f"(watchdog should notice within {DIRECT_DEAD_AFTER}s)", link)
+            else:
+                self.event("warn", f"unknown command {cmd!r}")
+                return
+        self.push_state()
 
     def send_chat(self, text):
         text = text.strip()
         if not text:
             return
-        if self.peer is None:
-            self.event("warn", "chat not sent: no peer connected")
+        if not self.links:
+            self.event("warn", "chat not sent: no other players connected")
             return
-        path = self._send_peer(self._pmsg("chat", text=text[:2000]))
-        entry = {"type": "chat", "ts": time.time(), "who": self.name, "mine": True, "text": text, "path": path}
+        paths = {}
+        for link in self.links.values():
+            path = self._send_peer(link, self._pmsg("chat", text=text[:2000]))
+            paths[link.name] = path
+            self.broadcast({"type": "pulse", "peer": link.id, "path": path, "dir": "out", "big": True})
+        uniq = set(paths.values())
+        entry = {"type": "chat", "ts": time.time(), "who": self.name, "mine": True, "text": text,
+                 "path": uniq.pop() if len(uniq) == 1 else "mixed", "paths": paths}
         self.chat.append(entry)
         self.broadcast(entry)
-        self.broadcast({"type": "pulse", "path": path, "dir": "out", "big": True})
-        log.info("CHAT  <%s via %s> %s", self.name, path.upper(), text)
-
-    # ============================================================ passthrough
-    def _on_app_datagram(self, data, addr):
-        if self.args.app_listen:
-            self.app_reply_addr = addr  # reply to whichever local app talked to us last
-        if self.peer is None:
-            return
-        self._send_peer(self._pmsg("app", b64=base64.b64encode(data).decode()))
-        self.stats["app_tx_packets"] += 1
-
-    def _deliver_app(self, msg, path):
-        if not self.app_transport or not self.app_reply_addr:
-            log.debug("drop app packet: passthrough not configured or no local app yet")
-            return
-        try:
-            self.app_transport.sendto(base64.b64decode(msg.get("b64", "")), self.app_reply_addr)
-            self.stats["app_rx_packets"] += 1
-        except (ValueError, OSError) as e:
-            log.debug("app deliver failed: %s", e)
+        log.info("CHAT  <%s> %s", self.name, text)
 
 
 # ==================================================================== web app
@@ -694,14 +951,15 @@ def build_app(peer: Peer):
 
     @app.post("/api/cmd")
     async def cmd(body: dict):
-        peer.command(body.get("cmd"), body.get("text"))
-        return {"ok": True, "state": peer.state}
+        peer.command(body)
+        return {"ok": True}
 
     @app.websocket("/ws")
     async def ws(sock: WebSocket):
         await sock.accept()
-        q = asyncio.Queue(maxsize=1000)
+        q = asyncio.Queue(maxsize=2000)
         peer.clients.add(q)
+        peer.had_client = True
         try:
             await sock.send_json({"type": "hello", "events": list(peer.events), "chat": list(peer.chat)})
             await sock.send_json(peer.snapshot())
@@ -713,8 +971,7 @@ def build_app(peer: Peer):
             sender = asyncio.create_task(pump())
             try:
                 while True:
-                    m = await sock.receive_json()
-                    peer.command(m.get("cmd"), m.get("text"))
+                    peer.command(await sock.receive_json())
             finally:
                 sender.cancel()
         except (WebSocketDisconnect, RuntimeError):
@@ -730,34 +987,56 @@ def stdin_chat(loop, peer):
     while True:
         try:
             line = input()
-        except (EOFError, KeyboardInterrupt):
+        except (EOFError, KeyboardInterrupt, RuntimeError):
             return
         loop.call_soon_threadsafe(peer.send_chat, line)
 
 
-async def amain(args):
+async def run(args, on_ready=None):
     peer = Peer(args)
     await peer.start()
-    if sys.stdin and sys.stdin.isatty():
+    if args.server or args.room:
+        peer.join(args.server or "127.0.0.1:9000", args.room or "demo", args.password or "", remember=False)
+    elif peer.config.get("autojoin") and peer.config.get("network"):
+        c = peer.config
+        peer.join(c.get("server"), c["network"], c.get("password") or "", c.get("name"))
+    elif not args.app_mode:
+        peer.join("127.0.0.1:9000", "demo", remember=False)  # zero-config local demo
+
+    if sys.stdin and sys.stdin.isatty() and not args.app_mode:
         threading.Thread(target=stdin_chat, args=(asyncio.get_running_loop(), peer), daemon=True).start()
-    url = f"http://{'localhost' if args.http_host in ('127.0.0.1', '0.0.0.0') else args.http_host}:{args.http_port}"
-    peer.event("info", f"dashboard on {url}  (type in this terminal to chat)")
-    if args.open:
-        import webbrowser
-        webbrowser.open(url)
     server = uvicorn.Server(uvicorn.Config(build_app(peer), host=args.http_host, port=args.http_port,
-                                           log_level="warning", lifespan="off"))
+                                           log_level="warning", lifespan="off",
+                                           log_config=None))  # we configure logging; also safe with no console
+    peer.http_server = server
+    url = f"http://127.0.0.1:{args.http_port}/" if args.http_host in ("127.0.0.1", "0.0.0.0") \
+        else f"http://{args.http_host}:{args.http_port}/"
+    peer.event("info", f"dashboard on {url}" + ("" if args.app_mode else "  (type in this terminal to chat)"))
+
+    async def announce():
+        while not server.started:
+            await asyncio.sleep(0.05)
+        if on_ready:
+            on_ready(url)
+        elif args.open:
+            import webbrowser
+            webbrowser.open(url)
+
+    asyncio.ensure_future(announce())
     try:
         await server.serve()
     finally:
         await peer.stop()
 
 
-def main():
-    ap = argparse.ArgumentParser(description="P2P UDP overlay peer with live dashboard")
-    ap.add_argument("--server", default="127.0.0.1:9000", help="rendezvous server host:port")
-    ap.add_argument("--room", default="demo", help="room code; both peers must use the same one")
-    ap.add_argument("--name", help="display name (default: random)")
+def build_parser():
+    ap = argparse.ArgumentParser(description="P2P UDP overlay / virtual LAN peer with live dashboard")
+    ap.add_argument("--server", help="rendezvous server host:port (default 127.0.0.1:9000)")
+    ap.add_argument("--room", help="network name; all players must use the same one (default 'demo')")
+    ap.add_argument("--password", help="network password (optional, must match)")
+    ap.add_argument("--name", help="display name (default: computer name)")
+    ap.add_argument("--vlan", action="store_true",
+                    help="create the virtual LAN adapter (needs admin/root) so LAN games can see each other")
     ap.add_argument("--bind", default="0.0.0.0", help="UDP bind address")
     ap.add_argument("--udp-port", type=int, default=0, help="UDP tunnel port (default: any free port)")
     ap.add_argument("--http-host", default="127.0.0.1", help="dashboard bind address")
@@ -767,25 +1046,34 @@ def main():
                     help="while on relay, retry direct every N seconds (0 = never)")
     ap.add_argument("--block-direct", action="store_true",
                     help="simulate a NAT that can't be punched: drop all direct packets from the start")
-    ap.add_argument("--app-listen", type=int, metavar="PORT",
-                    help="passthrough: accept a local UDP app on 127.0.0.1:PORT and tunnel it")
-    ap.add_argument("--app-target", metavar="HOST:PORT",
-                    help="passthrough: deliver tunneled app packets to this UDP address")
+    ap.add_argument("--config", help="settings file to remember the last network (used by the app)")
     ap.add_argument("--open", action="store_true", help="open the dashboard in a browser")
     ap.add_argument("--verbose", "-v", action="store_true", help="log every packet decision")
-    args = ap.parse_args()
-    if args.app_listen and args.app_target:
-        ap.error("use --app-listen on one peer and --app-target on the other, not both")
+    ap.set_defaults(app_mode=False, exit_when_closed=False)
+    return ap
 
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(errors="replace")  # Windows consoles + non-ASCII chat
-        sys.stderr.reconfigure(errors="replace")
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+
+def setup_logging(verbose, logfile=None):
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")  # Windows consoles + non-ASCII chat
+    handlers = []
+    if sys.stderr is not None:
+        handlers.append(logging.StreamHandler())
+    if logfile:
+        Path(logfile).parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(logfile, encoding="utf-8"))
+    logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO, handlers=handlers or None,
                         format="%(asctime)s.%(msecs)03d [%(name)s] %(message)s", datefmt="%H:%M:%S")
     for noisy in ("asyncio", "uvicorn", "websockets"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+def main():
+    args = build_parser().parse_args()
+    setup_logging(args.verbose)
     try:
-        asyncio.run(amain(args))
+        asyncio.run(run(args))
     except KeyboardInterrupt:
         pass
 

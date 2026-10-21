@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Rendezvous Peer</title>
+<title>Rendezvous</title>
 <style>
   :root {
     --bg: #0a0e14;
@@ -23,16 +23,17 @@
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; }
-  body { display: flex; flex-direction: column; }
   body {
+    display: flex; flex-direction: column;
     background: var(--bg); color: var(--text);
     font: 16px/1.4 system-ui, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   }
-  body[data-state=DISCOVERING]  { --state: var(--slate); }
-  body[data-state=PUNCHING]     { --state: var(--cyan); }
-  body[data-state=DIRECT]       { --state: var(--green); }
-  body[data-state=RELAY]        { --state: var(--amber); }
-  body[data-state=RECONNECTING] { --state: var(--red); }
+  body[data-tone=idle]  { --state: var(--slate); }
+  body[data-tone=punch] { --state: var(--cyan); }
+  body[data-tone=good]  { --state: var(--green); }
+  body[data-tone=relay] { --state: var(--amber); }
+  body[data-tone=bad]   { --state: var(--red); }
+  [hidden] { display: none !important; }
 
   /* ---------- header ---------- */
   header {
@@ -45,12 +46,12 @@
   .meta b { color: var(--text); font-family: var(--mono); font-weight: 600; }
   .spacer { flex: 1; }
   .badge {
-    font-weight: 800; font-size: 26px; letter-spacing: .08em; padding: 6px 20px; border-radius: 999px;
-    color: var(--state); border: 2px solid var(--state);
+    font-weight: 800; font-size: 20px; letter-spacing: .05em; padding: 6px 16px; border-radius: 999px;
+    color: var(--state); border: 2px solid var(--state); white-space: nowrap;
     background: color-mix(in srgb, var(--state) 14%, transparent);
     transition: color .3s, border-color .3s, background .3s;
   }
-  body[data-state=PUNCHING] .badge, body[data-state=RECONNECTING] .badge { animation: throb 1s ease-in-out infinite; }
+  body[data-tone=punch] .badge, body[data-tone=bad] .badge { animation: throb 1s ease-in-out infinite; }
   @keyframes throb { 50% { box-shadow: 0 0 0 8px color-mix(in srgb, var(--state) 18%, transparent); } }
   .live { font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
   .live i { width: 10px; height: 10px; border-radius: 50%; background: var(--red); display: inline-block; }
@@ -58,113 +59,125 @@
 
   /* ---------- layout ---------- */
   main {
-    display: grid; gap: 16px; padding: 16px 24px 20px;
-    grid-template-columns: minmax(0, 1.85fr) minmax(330px, 1fr);
+    display: grid; gap: 16px; padding: 16px 24px 20px; flex: 1; min-height: 600px;
+    grid-template-columns: minmax(0, 1.85fr) minmax(340px, 1fr);
     grid-template-rows: minmax(0, 1.45fr) minmax(0, 1fr);
-    grid-template-areas: "stage stats" "log side";
-    flex: 1; min-height: 600px;
+    grid-template-areas: "stage side" "log chat";
   }
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; min-height: 0; }
   .card h2 {
     margin: 0; font-size: 12px; letter-spacing: .16em; text-transform: uppercase; color: var(--muted); font-weight: 700;
   }
   .stage { grid-area: stage; position: relative; display: flex; flex-direction: column; overflow: hidden; }
-  .stats { grid-area: stats; padding: 16px; overflow: auto; display: flex; flex-direction: column; gap: 12px; }
+  .side { grid-area: side; padding: 14px; overflow: auto; display: flex; flex-direction: column; gap: 12px; }
   .log { grid-area: log; display: flex; flex-direction: column; overflow: hidden; }
-  .chat { grid-area: side; }
+  .chat { grid-area: chat; display: flex; flex-direction: column; overflow: hidden; }
 
   /* ---------- stage ---------- */
   #topo { flex: 1; width: 100%; min-height: 0; display: block; }
-  .caption {
-    padding: 0 24px 16px; display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
-  }
-  .caption .big { font-size: 26px; font-weight: 800; color: var(--state); letter-spacing: .02em; }
-  .caption .sub { font-size: 17px; color: var(--muted); flex: 1; min-width: 240px; }
-  .progress { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; width: 100%; display: none; }
-  .progress i { display: block; height: 100%; width: 0; background: var(--state); transition: width .25s linear; }
-  body[data-state=PUNCHING] .progress, body[data-state=RECONNECTING] .progress { display: block; }
-  .legend { position: absolute; top: 14px; left: 18px; display: flex; gap: 18px; font-size: 13px; color: var(--muted); flex-wrap: wrap; }
+  .caption { padding: 0 24px 14px; display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
+  .caption .big { font-size: 24px; font-weight: 800; color: var(--state); }
+  .caption .sub { font-size: 16px; color: var(--muted); flex: 1; min-width: 240px; }
+  .legend { position: absolute; top: 12px; left: 18px; display: flex; gap: 18px; font-size: 13px; color: var(--muted); flex-wrap: wrap; }
   .legend span::before { content: ""; display: inline-block; width: 22px; height: 4px; border-radius: 2px; vertical-align: middle; margin-right: 6px; background: var(--c); }
-
   .banner {
-    position: absolute; left: 50%; top: 52px; transform: translate(-50%, 0) scale(.9);
-    font-size: 34px; font-weight: 900; letter-spacing: .06em; padding: 14px 34px; border-radius: 16px;
+    position: absolute; left: 50%; bottom: 10px; transform: translate(-50%, 0) scale(.9);
+    font-size: 28px; font-weight: 900; letter-spacing: .04em; padding: 12px 30px; border-radius: 16px;
     background: var(--bg); border: 2px solid var(--bc, var(--state)); box-shadow: 0 10px 40px #000a;
     color: var(--bc, var(--state)); opacity: 0; pointer-events: none; white-space: nowrap;
     transition: opacity .25s, transform .25s;
   }
   .banner.show { opacity: 1; transform: translate(-50%, 0) scale(1); }
 
-  /* SVG */
-  .track { fill: none; stroke: var(--faint); stroke-width: 3; stroke-dasharray: 6 10; opacity: .55; transition: stroke .4s, opacity .4s; }
-  .glow { fill: none; stroke-width: 18; opacity: 0; stroke-linecap: round; transition: opacity .4s, stroke .4s; }
-  .flow { fill: none; stroke-width: 7; stroke-linecap: round; stroke-dasharray: 1 22; opacity: 0; transition: opacity .4s, stroke .4s; animation: march 0.9s linear infinite; }
-  .solid { fill: none; stroke-width: 5; opacity: 0; stroke-linecap: round; transition: opacity .4s, stroke .4s; }
-  @keyframes march { to { stroke-dashoffset: -23; } }
-  #direct .glow, #direct .flow, #direct .solid { stroke: var(--green); }
-  #relay  .glow, #relay  .flow, #relay  .solid { stroke: var(--amber); }
+  /* SVG links: .d = direct route, .r = relay route through the server */
+  .track { fill: none; stroke: var(--faint); stroke-width: 2.5; stroke-dasharray: 6 10; opacity: .5; transition: stroke .4s, opacity .4s; }
+  .glow { fill: none; stroke-width: 16; opacity: 0; stroke-linecap: round; transition: opacity .4s; }
+  .flow { fill: none; stroke-width: 6; stroke-linecap: round; stroke-dasharray: 1 20; opacity: 0; transition: opacity .4s; animation: march .9s linear infinite; }
+  .solid { fill: none; stroke-width: 4; opacity: 0; stroke-linecap: round; transition: opacity .4s; }
+  @keyframes march { to { stroke-dashoffset: -21; } }
+  .d.glow, .d.flow, .d.solid { stroke: var(--green); }
+  .r.glow, .r.flow, .r.solid { stroke: var(--amber); }
+  .r.track { opacity: .18; }
 
-  body[data-state=DIRECT] #direct :is(.glow) { opacity: .16; }
-  body[data-state=DIRECT] #direct :is(.flow, .solid) { opacity: 1; }
-  body[data-state=DIRECT] #direct .track { opacity: 0; }
-
-  body:is([data-state=RELAY], [data-state=RECONNECTING], [data-state=PUNCHING]) #relay .solid { opacity: .9; }
-  body:is([data-state=RELAY], [data-state=RECONNECTING], [data-state=PUNCHING]) #relay .flow { opacity: 1; }
-  body[data-state=RELAY] #relay .glow { opacity: .16; }
-  body:is([data-state=RECONNECTING], [data-state=PUNCHING]) #relay :is(.solid, .flow) { opacity: .45; }
-  body:is([data-state=RELAY], [data-state=RECONNECTING], [data-state=PUNCHING]) #relay .track { opacity: 0; }
-
-  body[data-state=PUNCHING] #direct .track { stroke: var(--cyan); opacity: 1; animation: blink .5s steps(2) infinite; }
-  body[data-state=RECONNECTING] #direct .track { stroke: var(--red); opacity: 1; stroke-width: 4; animation: blink .4s steps(2) infinite; }
+  .link[data-state=DIRECT] .d:is(.flow, .solid) { opacity: 1; }
+  .link[data-state=DIRECT] .d.glow { opacity: .14; }
+  .link[data-state=DIRECT] .d.track { opacity: 0; }
+  .link:is([data-state=RELAY], [data-state=RECONNECTING], [data-state=PUNCHING]) .r:is(.flow, .solid) { opacity: .9; }
+  .link[data-state=RELAY] .r.glow { opacity: .12; }
+  .link:is([data-state=RECONNECTING], [data-state=PUNCHING]) .r:is(.flow, .solid) { opacity: .4; }
+  .link:is([data-state=RELAY], [data-state=RECONNECTING], [data-state=PUNCHING]) .r.track { opacity: 0; }
+  .link[data-state=PUNCHING] .d.track { stroke: var(--cyan); opacity: 1; animation: blink .5s steps(2) infinite; }
+  .link[data-state=RECONNECTING] .d.track { stroke: var(--red); opacity: 1; stroke-width: 3.5; animation: blink .4s steps(2) infinite; }
   @keyframes blink { 50% { opacity: .25; } }
+  .drop { opacity: 0; transition: opacity .3s; }
+  .link.blackhole .drop { opacity: 1; }
+  .drop line { stroke: var(--red); stroke-width: 6; stroke-linecap: round; }
 
-  .node circle.ring { fill: var(--card-2); stroke: var(--state); stroke-width: 4; transition: stroke .4s; }
-  .node .name { font-size: 26px; font-weight: 800; fill: var(--text); text-anchor: middle; }
-  .node .role { font-size: 13px; letter-spacing: .18em; fill: var(--muted); text-anchor: middle; font-weight: 700; }
-  .node .addr { font-size: 16px; fill: var(--muted); text-anchor: middle; font-family: var(--mono); }
+  .node circle.ring { fill: var(--card-2); stroke: var(--sc, var(--state)); stroke-width: 4; transition: stroke .4s; }
   .node .icon { fill: none; stroke: var(--text); stroke-width: 3; stroke-linejoin: round; }
-  #peerNode.absent { opacity: .35; }
-  #peerNode.absent circle.ring { stroke: var(--slate); stroke-dasharray: 8 8; animation: spin 6s linear infinite; transform-origin: 850px 330px; }
+  .node .name { font-size: 24px; font-weight: 800; fill: var(--text); }
+  .node .vip { font-size: 16px; fill: var(--muted); font-family: var(--mono); }
+  .node .st { font-size: 12px; font-weight: 800; letter-spacing: .14em; fill: var(--sc); }
+  .node .role { font-size: 13px; letter-spacing: .18em; fill: var(--muted); font-weight: 700; text-anchor: middle; }
+  .pnode { cursor: pointer; }
+  .pnode.sel circle.ring { stroke-width: 7; }
+  .s-DIRECT { --sc: var(--green); } .s-RELAY { --sc: var(--amber); } .s-PUNCHING { --sc: var(--cyan); }
+  .s-RECONNECTING { --sc: var(--red); } .s-DISCOVERING { --sc: var(--slate); }
+  #ghost { opacity: .35; }
+  #ghost circle { fill: none; stroke: var(--slate); stroke-width: 3; stroke-dasharray: 8 8; animation: spin 6s linear infinite; transform-box: fill-box; transform-origin: center; }
   @keyframes spin { to { transform: rotate(360deg); } }
-  #serverNode rect { fill: var(--card-2); stroke: var(--amber); stroke-width: 3; transition: stroke .4s; }
-  body:not([data-state=RELAY]):not([data-state=RECONNECTING]):not([data-state=PUNCHING]) #serverNode rect { stroke: var(--faint); }
+  #ghost text { fill: var(--muted); font-size: 20px; }
+  #serverNode rect { fill: var(--card-2); stroke: var(--faint); stroke-width: 3; transition: stroke .4s; }
+  #serverNode.relaying rect { stroke: var(--amber); }
   #serverNode.down rect { stroke: var(--red); stroke-dasharray: 6 6; }
   #serverNode .title { font-size: 15px; font-weight: 800; letter-spacing: .16em; fill: var(--text); text-anchor: middle; }
-  #serverNode .addr { font-size: 15px; fill: var(--muted); text-anchor: middle; font-family: var(--mono); }
-  #drop { opacity: 0; transition: opacity .3s; }
-  body.blackhole #drop { opacity: 1; }
-  #drop line { stroke: var(--red); stroke-width: 7; stroke-linecap: round; }
-  #drop text { fill: var(--red); font-size: 15px; font-weight: 800; letter-spacing: .14em; text-anchor: middle; }
-  .pkt { stroke: none; }
-  .pkt.direct { fill: var(--green); }
-  .pkt.relay { fill: var(--amber); }
-  .pkt.punch { fill: var(--cyan); }
-  .pkt.dead { fill: var(--red); }
+  #serverNode .addr { font-size: 14px; fill: var(--muted); text-anchor: middle; font-family: var(--mono); }
+  .pkt.direct { fill: var(--green); } .pkt.relay { fill: var(--amber); }
+  .pkt.punch { fill: var(--cyan); } .pkt.dead { fill: var(--red); }
+  .pkt.data { opacity: .85; }
   .burst { fill: none; stroke-width: 3; }
 
-  /* ---------- stats ---------- */
-  .tiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
-  .tile { background: var(--card-2); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; min-width: 0; }
-  .tile .k { font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); font-weight: 700; }
-  .tile .v { font-size: 24px; font-weight: 800; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .tile .v small { font-size: 14px; color: var(--muted); font-weight: 600; }
-  .tile.wide { grid-column: 1 / -1; }
-  .rtt-row { display: flex; align-items: flex-end; gap: 14px; }
-  #rttVal { font-size: 42px; line-height: 1.05; flex: none; }
-  .path-direct { color: var(--green); }
-  .path-relay { color: var(--amber); }
-  #spark { flex: 1; min-width: 0; height: 52px; display: block; }
-  .meter { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; margin-top: 8px; }
-  .meter i { display: block; height: 100%; width: 0; background: var(--green); transition: width .25s linear, background .25s; }
-  .endpoints { font-family: var(--mono); font-size: 13.5px; display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; }
-  .endpoints span:nth-child(odd) { color: var(--muted); font-family: system-ui, "Segoe UI", sans-serif; }
-  .endpoints span:nth-child(even) { overflow-wrap: anywhere; }
+  /* ---------- side panel ---------- */
+  .me { background: var(--card-2); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; }
+  .me .row { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+  .me .ip { font: 800 34px var(--mono); letter-spacing: -.01em; cursor: copy; }
+  .me .ip small { font: 600 13px system-ui, sans-serif; color: var(--muted); letter-spacing: .1em; }
+  .vstatus { font-size: 14px; margin-top: 4px; padding: 6px 10px; border-radius: 8px; border-left: 3px solid; }
+  .vstatus.up { border-color: var(--green); background: color-mix(in srgb, var(--green) 10%, transparent); }
+  .vstatus.starting { border-color: var(--cyan); background: color-mix(in srgb, var(--cyan) 10%, transparent); }
+  .vstatus.error { border-color: var(--red); background: color-mix(in srgb, var(--red) 10%, transparent); }
+  .vstatus.off { border-color: var(--faint); color: var(--muted); }
+  .kv { font-size: 13px; color: var(--muted); display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; margin-top: 8px; }
+  .kv b { color: var(--text); font-family: var(--mono); font-weight: 500; overflow-wrap: anywhere; }
+  .linkbtn { background: none; border: 1px solid var(--line); color: var(--muted); font: inherit; font-size: 13px; padding: 4px 10px; border-radius: 8px; cursor: pointer; }
+  .linkbtn:hover { color: var(--text); border-color: var(--faint); }
+
+  .peers { display: flex; flex-direction: column; gap: 10px; }
+  .pcard { background: var(--card-2); border: 1px solid var(--line); border-left: 4px solid var(--sc); border-radius: 12px; padding: 10px 12px; cursor: pointer; }
+  .pcard.sel { border-color: var(--sc); box-shadow: 0 0 0 1px var(--sc) inset; }
+  .pcard .top { display: flex; align-items: baseline; gap: 10px; }
+  .pcard .nm { font-weight: 800; font-size: 19px; }
+  .pcard .ip { font-family: var(--mono); color: var(--muted); font-size: 15px; }
+  .pcard .chip { margin-left: auto; color: var(--sc); }
+  .pcard .nums { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px 10px; margin-top: 6px; }
+  .pcard .nums div { font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); font-weight: 700; }
+  .pcard .nums b { display: block; font-size: 18px; letter-spacing: 0; text-transform: none; color: var(--text); font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .pcard .rtt b { color: var(--rc, var(--text)); }
+  .pcard canvas { width: 100%; height: 34px; display: block; margin-top: 6px; }
+  .meter { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin-top: 6px; }
+  .meter i { display: block; height: 100%; width: 0; transition: width .25s linear, background .25s; }
+  .pcard .detail { font-size: 12.5px; color: var(--muted); margin-top: 6px; font-family: var(--mono); overflow-wrap: anywhere; }
+  .pcard .acts { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+  .pcard .acts button { font-size: 12.5px; padding: 5px 10px; }
+  .empty { color: var(--faint); font-size: 14px; text-align: center; padding: 14px; }
+  .hint { font-size: 13.5px; color: var(--muted); background: var(--card-2); border: 1px dashed var(--line); border-radius: 10px; padding: 10px 12px; }
+  .hint b { color: var(--text); }
 
   /* ---------- log ---------- */
   .card-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px 8px; gap: 12px; }
-  #events { list-style: none; margin: 0; padding: 0 8px 10px 16px; overflow-y: auto; flex: 1; font-size: 15px; }
-  #events li { display: grid; grid-template-columns: 112px 1fr; gap: 10px; padding: 3px 6px 3px 10px; border-left: 3px solid var(--faint); margin: 1px 0; }
-  #events li time { font-family: var(--mono); color: var(--muted); font-size: 13.5px; padding-top: 1px; }
+  #events { list-style: none; margin: 0; padding: 0 8px 10px 16px; overflow-y: auto; flex: 1; font-size: 14.5px; }
+  #events li { display: grid; grid-template-columns: 108px 1fr; gap: 10px; padding: 3px 6px 3px 10px; border-left: 3px solid var(--faint); margin: 1px 0; }
+  #events li time { font-family: var(--mono); color: var(--muted); font-size: 13px; padding-top: 1px; }
   #events li.good { border-color: var(--green); }
   #events li.warn { border-color: var(--amber); }
   #events li.bad { border-color: var(--red); }
@@ -173,70 +186,68 @@
   #events li.punch { color: var(--muted); }
   .toggle { font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 6px; cursor: pointer; }
 
-  /* ---------- controls + chat ---------- */
+  /* ---------- buttons, chat ---------- */
   .btns { display: flex; gap: 10px; flex-wrap: wrap; }
   button {
-    font: inherit; font-weight: 800; font-size: 16px; color: var(--bg); border: 0; border-radius: 10px; padding: 11px 16px;
+    font: inherit; font-weight: 800; font-size: 15px; color: var(--bg); border: 0; border-radius: 10px; padding: 10px 15px;
     cursor: pointer; background: var(--bc); transition: transform .08s, filter .2s, opacity .2s; white-space: nowrap;
   }
   button:hover { filter: brightness(1.12); }
   button:active { transform: scale(.97); }
   button:disabled { opacity: .3; cursor: not-allowed; }
   button kbd { font: 700 11px var(--mono); opacity: .65; border: 1px solid; border-radius: 4px; padding: 0 4px; margin-left: 4px; vertical-align: 2px; }
-  #bRelay { --bc: var(--amber); } #bPunch { --bc: var(--cyan); } #bDrop { --bc: var(--red); }
-  .flags { position: absolute; top: 12px; right: 16px; display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
-  .flag { font-size: 12px; font-weight: 800; letter-spacing: .1em; padding: 4px 10px; border-radius: 999px; border: 1px solid; }
-  .flag.relay { color: var(--amber); } .flag.drop { color: var(--red); }
-
-  .chat { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  .b-relay { --bc: var(--amber); } .b-punch { --bc: var(--cyan); } .b-drop { --bc: var(--red); } .b-plain { --bc: var(--text); }
+  .chip { font-size: 10.5px; font-weight: 800; letter-spacing: .1em; padding: 1px 7px; border-radius: 999px; border: 1px solid currentColor; white-space: nowrap; }
+  .chip.direct { color: var(--green); } .chip.relay { color: var(--amber); } .chip.mixed { color: var(--cyan); }
   #msgs { flex: 1; overflow-y: auto; padding: 4px 16px; display: flex; flex-direction: column; gap: 8px; }
   .msg { max-width: 85%; align-self: flex-start; background: var(--card-2); border: 1px solid var(--line); border-radius: 12px; padding: 7px 12px; }
   .msg.mine { align-self: flex-end; border-color: color-mix(in srgb, var(--cyan) 35%, var(--line)); }
   .msg .who { font-size: 12px; color: var(--muted); display: flex; gap: 8px; align-items: center; }
-  .msg .text { font-size: 18px; overflow-wrap: anywhere; }
-  .chip { font-size: 10.5px; font-weight: 800; letter-spacing: .1em; padding: 1px 7px; border-radius: 999px; border: 1px solid currentColor; }
-  .chip.direct { color: var(--green); } .chip.relay { color: var(--amber); }
-  .empty { color: var(--faint); font-size: 14px; margin: auto; text-align: center; }
-  form { display: flex; gap: 8px; padding: 10px 12px 12px; }
+  .msg .text { font-size: 17px; overflow-wrap: anywhere; }
+  form.send { display: flex; gap: 8px; padding: 10px 12px 12px; }
   input {
-    flex: 1; min-width: 0; font: inherit; font-size: 17px; color: var(--text); background: var(--card-2);
+    flex: 1; min-width: 0; font: inherit; font-size: 16px; color: var(--text); background: var(--card-2);
     border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
   }
   input:focus { outline: 2px solid color-mix(in srgb, var(--cyan) 60%, transparent); border-color: transparent; }
-  form button { --bc: var(--text); padding: 10px 18px; }
 
-  @media (max-width: 1400px) {
-    .brand small, button kbd { display: none; }
-    .live span { display: none; }
-  }
-  /* ---------- narrow screens ---------- */
+  /* ---------- join dialog ---------- */
+  #joinView { position: fixed; inset: 0; background: color-mix(in srgb, var(--bg) 88%, transparent); display: grid; place-items: center; z-index: 10; padding: 16px; }
+  .joinbox { width: min(460px, 100%); background: var(--card); border: 1px solid var(--line); border-radius: 18px; padding: 26px; box-shadow: 0 20px 60px #000c; }
+  .joinbox h1 { margin: 0 0 4px; font-size: 26px; }
+  .joinbox p { margin: 0 0 18px; color: var(--muted); font-size: 14.5px; }
+  .joinbox label { display: block; font-size: 12px; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); font-weight: 700; margin: 12px 0 5px; }
+  .joinbox input { width: 100%; }
+  .joinbox .row { display: flex; gap: 10px; margin-top: 20px; }
+  .joinbox .row button { flex: 1; padding: 13px; font-size: 16px; }
+  #joinErr { color: var(--red); font-size: 14px; min-height: 20px; margin-top: 10px; }
+
+  @media (max-width: 1400px) { .brand small, button kbd { display: none; } .live span { display: none; } }
   @media (max-width: 1050px) {
-    main { grid-template-columns: minmax(0, 1fr); grid-template-rows: none; grid-template-areas: "stage" "stats" "side" "log"; height: auto; padding: 12px 16px; }
-    .legend { position: static; padding: 12px 16px 0; gap: 4px 14px; }
-    .flags { top: auto; bottom: 10px; }
-    .btns { width: 100%; } .btns button { flex: 1; padding: 10px 6px; font-size: 14px; }
-    .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    body { display: block; height: auto; }
+    main { grid-template-columns: minmax(0, 1fr); grid-template-rows: none; grid-template-areas: "stage" "side" "chat" "log"; padding: 12px 16px; }
     .stage { min-height: 380px; }
     .log { height: 420px; } .chat { height: 360px; }
-    header { padding: 10px 16px; gap: 12px; }
-    .badge { font-size: 20px; }
-    .banner { font-size: 20px; top: 8px; }
-    body { display: block; height: auto; }
+    header { padding: 10px 16px; gap: 10px; }
+    .legend { position: static; padding: 12px 16px 0; gap: 4px 14px; }
+    .btns { width: 100%; } .btns button { flex: 1; padding: 10px 6px; font-size: 14px; }
+    .badge { font-size: 18px; }
+    .banner { font-size: 16px; bottom: 6px; }
   }
 </style>
 </head>
-<body data-state="DISCOVERING">
+<body data-tone="idle">
 <header>
-  <div class="brand">RENDEZVOUS<small>userspace NAT traversal · live path view</small></div>
-  <div class="meta">room <b id="room">-</b> &nbsp;·&nbsp; you are <b id="hdrName">-</b></div>
+  <div class="brand">RENDEZVOUS<small>peer-to-peer virtual LAN · live path view</small></div>
+  <div class="meta" id="hdrMeta">not connected</div>
   <div class="spacer"></div>
-  <div class="btns">
-    <button id="bRelay" data-cmd="force_relay" title="pin traffic to the relay on both peers">Force Relay <kbd>R</kbd></button>
-    <button id="bPunch" data-cmd="repunch" title="clear overrides and hole-punch again">Force Re-punch <kbd>P</kbd></button>
-    <button id="bDrop" data-cmd="drop_direct" title="silently discard all direct packets; the keepalive watchdog must notice">Drop Direct Path <kbd>D</kbd></button>
+  <div class="btns" title="apply to every link">
+    <button class="b-relay" data-cmd="force_relay">Force Relay <kbd>R</kbd></button>
+    <button class="b-punch" data-cmd="repunch">Re-punch <kbd>P</kbd></button>
+    <button class="b-drop" data-cmd="drop_direct">Drop Direct <kbd>D</kbd></button>
   </div>
   <div class="live" id="live"><i></i><span>connecting…</span></div>
-  <div class="badge" id="badge">DISCOVERING</div>
+  <div class="badge" id="badge">OFFLINE</div>
 </header>
 
 <main>
@@ -244,228 +255,322 @@
     <div class="legend">
       <span style="--c: var(--green)">direct (peer ↔ peer)</span>
       <span style="--c: var(--amber)">relay (via server)</span>
-      <span style="--c: var(--cyan)">punch / keepalive packets</span>
+      <span style="--c: var(--cyan)">punch / keepalive</span>
     </div>
-    <svg id="topo" viewBox="0 0 1000 470" preserveAspectRatio="xMidYMid meet" aria-label="connection topology">
-      <!-- relay route: bent up through the server -->
-      <g id="relay">
-        <path class="track" d="M150,330 C230,170 370,110 500,110 C630,110 770,170 850,330"/>
-        <path class="glow"  d="M150,330 C230,170 370,110 500,110 C630,110 770,170 850,330"/>
-        <path class="solid" d="M150,330 C230,170 370,110 500,110 C630,110 770,170 850,330"/>
-        <path class="flow" id="p-relay" d="M150,330 C230,170 370,110 500,110 C630,110 770,170 850,330"/>
-      </g>
-      <!-- direct route: straight between the peers -->
-      <g id="direct">
-        <path class="track" d="M150,330 L850,330"/>
-        <path class="glow"  d="M150,330 L850,330"/>
-        <path class="solid" d="M150,330 L850,330"/>
-        <path class="flow" id="p-direct" d="M150,330 L850,330"/>
-      </g>
-      <g id="drop">
-        <line x1="482" y1="312" x2="518" y2="348"/><line x1="518" y1="312" x2="482" y2="348"/>
-        <text x="500" y="380">DROPPED</text>
-      </g>
+    <svg id="topo" viewBox="0 0 1000 500" preserveAspectRatio="xMidYMid meet" aria-label="connection topology">
+      <g id="links"></g>
       <g id="pkts"></g>
-
       <g id="serverNode">
-        <rect x="370" y="72" width="260" height="76" rx="16"/>
-        <text class="title" x="500" y="104">RENDEZVOUS · RELAY</text>
-        <text class="addr" id="srvAddr" x="500" y="130">-</text>
+        <rect x="380" y="58" width="240" height="70" rx="16"/>
+        <text class="title" x="500" y="88">RENDEZVOUS · RELAY</text>
+        <text class="addr" id="srvAddr" x="500" y="112">-</text>
       </g>
       <g class="node" id="meNode">
-        <circle class="ring" cx="150" cy="330" r="60"/>
-        <g class="icon" transform="translate(150 330)"><rect x="-24" y="-20" width="48" height="31" rx="3"/><path d="M-32,18 H32 L26,11 H-26 Z"/></g>
-        <text class="role" x="150" y="252">YOU</text>
-        <text class="name" id="meName" x="150" y="425">-</text>
-        <text class="addr" id="meAddr" x="150" y="452">-</text>
+        <circle class="ring" cx="150" cy="300" r="62"/>
+        <g class="icon" transform="translate(150 300)"><rect x="-24" y="-20" width="48" height="31" rx="3"/><path d="M-32,18 H32 L26,11 H-26 Z"/></g>
+        <text class="role" x="150" y="220">YOU</text>
+        <text class="name" id="meName" x="150" y="395" text-anchor="middle">-</text>
+        <text class="vip" id="meVip" x="150" y="421" text-anchor="middle">-</text>
       </g>
-      <g class="node absent" id="peerNode">
-        <circle class="ring" cx="850" cy="330" r="60"/>
-        <g class="icon" transform="translate(850 330)"><rect x="-24" y="-20" width="48" height="31" rx="3"/><path d="M-32,18 H32 L26,11 H-26 Z"/></g>
-        <text class="role" x="850" y="252">PEER</text>
-        <text class="name" id="peerName" x="850" y="425">waiting…</text>
-        <text class="addr" id="peerAddr" x="850" y="452">-</text>
+      <g id="pnodes"></g>
+      <g id="ghost">
+        <circle cx="800" cy="300" r="50"/>
+        <text x="800" y="385" text-anchor="middle">waiting for players…</text>
       </g>
     </svg>
     <div class="caption">
-      <div class="big" id="capBig">DISCOVERING</div>
-      <div class="sub" id="capSub">Contacting rendezvous server…</div>
-      <div class="progress"><i id="punchBar"></i></div>
+      <div class="big" id="capBig">OFFLINE</div>
+      <div class="sub" id="capSub">Join a network to start.</div>
     </div>
-    <div class="flags" id="flags"></div>
     <div class="banner" id="banner"></div>
   </section>
 
-  <aside class="card stats">
-    <div class="tiles">
-      <div class="tile wide">
-        <div class="k">Round-trip time <span id="rttPathLbl"></span></div>
-        <div class="rtt-row"><div class="v" id="rttVal">–</div><canvas id="spark"></canvas></div>
+  <aside class="card side">
+    <div class="me">
+      <div class="row">
+        <h2>This PC</h2>
+        <span><button class="linkbtn" id="leaveBtn">Leave network</button> <button class="linkbtn" id="quitBtn" hidden>Quit</button></span>
       </div>
-      <div class="tile"><div class="k">Path</div><div class="v" id="pathVal">none</div></div>
-      <div class="tile"><div class="k">In state</div><div class="v" id="sinceVal">0s</div></div>
-      <div class="tile"><div class="k">Punches</div><div class="v" id="punchVal">0</div></div>
-      <div class="tile"><div class="k">Bytes out</div><div class="v" id="txVal">0 B</div></div>
-      <div class="tile"><div class="k">Bytes in</div><div class="v" id="rxVal">0 B</div></div>
-      <div class="tile"><div class="k">Pkts out / in</div><div class="v" id="pktVal">0 / 0</div></div>
-      <div class="tile wide">
-        <div class="k">Direct keepalive · last packet <span id="silenceLbl">–</span></div>
-        <div class="meter"><i id="silenceBar"></i></div>
+      <div class="ip" id="myIp" title="click to copy">–</div>
+      <div class="vstatus off" id="vstatus">virtual LAN off</div>
+      <div class="kv">
+        <span>Network</span><b id="kNet">-</b>
+        <span>Public endpoint</span><b id="kPub">-</b>
+        <span>Rendezvous</span><b id="kSrv">-</b>
       </div>
     </div>
-    <h2>Endpoints</h2>
-    <div class="endpoints">
-      <span>You (public)</span><span id="eMePub">-</span>
-      <span>You (local)</span><span id="eMeLoc">-</span>
-      <span>Peer (public)</span><span id="ePeerPub">-</span>
-      <span>Peer (local)</span><span id="ePeerLoc">-</span>
-      <span>Direct locked to</span><span id="eDirect">-</span>
-      <span>Rendezvous</span><span id="eSrv">-</span>
-    </div>
+    <div class="card-head" style="padding:0"><h2>Players <span id="pcount"></span></h2><span class="toggle">click a player for details</span></div>
+    <div class="peers" id="peers"></div>
+    <div class="hint" id="hint"></div>
   </aside>
 
   <section class="card log">
     <div class="card-head">
       <h2>Event log</h2>
-      <label class="toggle"><input type="checkbox" id="showPunch" checked style="flex:none;width:auto"> show punch attempts</label>
+      <label class="toggle"><input type="checkbox" id="showPunch" style="flex:none;width:auto"> show punch attempts</label>
     </div>
     <ul id="events"></ul>
   </section>
 
   <section class="card chat">
-      <div class="card-head"><h2>Tunnel chat</h2><span class="toggle">each message shows the path it took</span></div>
-      <div id="msgs"><div class="empty" id="chatEmpty">Messages typed here travel through the tunnel on the active path.</div></div>
-      <form id="chatForm" autocomplete="off">
-        <input id="chatIn" placeholder="Type a message…" maxlength="2000">
-        <button type="submit">Send</button>
-      </form>
+    <div class="card-head"><h2>Chat</h2><span class="toggle">each message shows the path it took</span></div>
+    <div id="msgs"></div>
+    <form class="send" id="chatForm" autocomplete="off">
+      <input id="chatIn" placeholder="Message everyone in the network…" maxlength="2000">
+      <button type="submit" class="b-plain">Send</button>
+    </form>
   </section>
 </main>
+
+<div id="joinView" hidden>
+  <form class="joinbox" id="joinForm" autocomplete="off">
+    <h1>Join a network</h1>
+    <p>Everyone who enters the same server, network name and password ends up on one virtual LAN.</p>
+    <label for="jServer">Rendezvous server</label>
+    <input id="jServer" placeholder="203.0.113.10:9000" required>
+    <label for="jNet">Network name</label>
+    <input id="jNet" placeholder="friday-games" required>
+    <label for="jPass">Password (optional)</label>
+    <input id="jPass" type="password" placeholder="shared secret">
+    <label for="jName">Your name</label>
+    <input id="jName" placeholder="alice" maxlength="32">
+    <div id="joinErr"></div>
+    <div class="row">
+      <button type="submit" class="b-punch">Join</button>
+    </div>
+  </form>
+</div>
 
 <script>
 (() => {
   const $ = (id) => document.getElementById(id);
   const NS = "http://www.w3.org/2000/svg";
-  let S = null, ws = null, prevState = null;
+  const ME = { x: 150, y: 300 }, SRV = { x: 500, y: 128 };
+  let S = null, ws = null, selected = null, layoutKey = "", joinShownFor = null;
   const seenEvents = new Set();
+  const nodes = {};   // peer id -> {x, y, r, g, link}
 
-  const CAPTIONS = {
-    DISCOVERING: (s) => s.me.public === "-" ? "Contacting rendezvous server…"
-      : s.server_ok === false ? "Rendezvous server unreachable — retrying registration"
-      : `Registered as ${s.me.public}. Waiting for a peer to join room “${s.room}”.`,
-    PUNCHING: (s) => `Both peers fire UDP packets at each other's public endpoint to open their NATs. Traffic uses the relay meanwhile.`,
-    DIRECT: (s) => `Peer-to-peer through the punched hole. The server is no longer in the data path.`,
-    RELAY: (s) => s.forced_relay ? `Relay pinned by operator. The server forwards every packet between the peers.`
-      : `Hole punching failed. The server forwards every packet between the peers${s.blackhole ? " (direct path is being dropped)" : ""}.`,
-    RECONNECTING: (s) => `Direct path went silent. Traffic moved to the relay while re-punching.`,
-  };
-  const COLORS = { DISCOVERING: "--slate", PUNCHING: "--cyan", DIRECT: "--green", RELAY: "--amber", RECONNECTING: "--red" };
+  const TONE = { DIRECT: "good", RELAY: "relay", PUNCHING: "punch", RECONNECTING: "bad", DISCOVERING: "idle" };
+  const RANK = { RECONNECTING: 4, PUNCHING: 3, DISCOVERING: 2, RELAY: 1, DIRECT: 0 };
+  const SHORT = { DIRECT: "DIRECT", RELAY: "RELAY", PUNCHING: "PUNCH", RECONNECTING: "RECONN", DISCOVERING: "NEW" };
+  const COLOR = { DIRECT: "--green", RELAY: "--amber", PUNCHING: "--cyan", RECONNECTING: "--red", DISCOVERING: "--slate", GONE: "--red" };
 
-  function bytes(n) {
-    n = n || 0;
-    if (n < 1024) return n + " B";
-    if (n < 1048576) return (n / 1024).toFixed(1) + " KB";
-    return (n / 1048576).toFixed(2) + " MB";
-  }
+  const bytes = (n) => { n = n || 0; return n < 1024 ? n + " B" : n < 1048576 ? (n / 1024).toFixed(1) + " KB" : (n / 1048576).toFixed(2) + " MB"; };
   const hms = (ts) => { const d = new Date(ts * 1000); return d.toTimeString().slice(0, 8) + "." + String(d.getMilliseconds()).padStart(3, "0"); };
-  const esc = (t) => t.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const el = (tag, attrs = {}, parent) => { const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); parent && parent.appendChild(e); return e; };
 
-  // ---------------------------------------------------------------- render
+  // ------------------------------------------------------------ topology
+  function layout(peers) {
+    const n = peers.length, r = n <= 2 ? 50 : n <= 4 ? 40 : 30;
+    const top = 110, bottom = 440;
+    return peers.map((p, i) => ({ id: p.id, x: 790, y: n === 1 ? 300 : top + i * (bottom - top) / (n - 1), r }));
+  }
+  function rebuild(peers) {
+    $("links").innerHTML = ""; $("pnodes").innerHTML = "";
+    for (const k in nodes) delete nodes[k];
+    for (const pos of layout(peers)) {
+      const { id, x, y, r } = pos;
+      const dD = `M${ME.x},${ME.y} L${x},${y}`;
+      const dR = `M${ME.x},${ME.y} C${ME.x + 70},${ME.y - 140} ${SRV.x - 140},${SRV.y - 30} ${SRV.x},${SRV.y - 30} C${SRV.x + 140},${SRV.y - 30} ${x - 60},${Math.max(30, y - 150)} ${x},${y}`;
+      const g = el("g", { class: "link" }, $("links"));
+      for (const c of ["track", "glow", "solid", "flow"]) el("path", { class: "r " + c, d: dR }, g);
+      for (const c of ["track", "glow", "solid", "flow"]) el("path", { class: "d " + c, d: dD }, g);
+      const mx = (ME.x + x) / 2, my = (ME.y + y) / 2, drop = el("g", { class: "drop" }, g);
+      el("line", { x1: mx - 14, y1: my - 14, x2: mx + 14, y2: my + 14 }, drop);
+      el("line", { x1: mx + 14, y1: my - 14, x2: mx - 14, y2: my + 14 }, drop);
+
+      const n = el("g", { class: "node pnode", "data-id": id }, $("pnodes"));
+      el("circle", { class: "ring", cx: x, cy: y, r }, n);
+      const s = r / 50;
+      const icon = el("g", { class: "icon", transform: `translate(${x} ${y}) scale(${s})` }, n);
+      el("rect", { x: -24, y: -20, width: 48, height: 31, rx: 3 }, icon);
+      el("path", { d: "M-32,18 H32 L26,11 H-26 Z" }, icon);
+      const tx = x + r + 14;
+      const name = el("text", { class: "name", x: tx, y: y - 6 }, n);
+      const vip = el("text", { class: "vip", x: tx, y: y + 16 }, n);
+      const st = el("text", { class: "st", x: tx, y: y + 36 }, n);
+      n.addEventListener("click", () => select(id));
+      nodes[id] = { x, y, r, g, n, name, vip, st, dPath: g.querySelector(".d.flow"), rPath: g.querySelector(".r.flow"), mid: [mx, my] };
+    }
+  }
+
+  function select(id) { selected = selected === id ? null : id; if (S) render(S); }
+
+  // --------------------------------------------------------------- render
   function render(s) {
     S = s;
-    document.body.dataset.state = s.state;
-    document.body.classList.toggle("blackhole", !!s.blackhole);
-    $("badge").textContent = s.state;
-    $("room").textContent = s.room;
-    $("hdrName").textContent = s.me.name;
-    document.title = `${s.state} · ${s.me.name}`;
+    const peers = s.peers || [];
+    if (selected && !peers.some((p) => p.id === selected)) selected = null;
 
+    // join dialog
+    $("joinView").hidden = s.joined;
+    if (!s.joined && joinShownFor !== "shown") {
+      joinShownFor = "shown";
+      $("jServer").value = s.saved.server || "";
+      $("jNet").value = s.saved.network || "";
+      $("jName").value = s.saved.name || s.me.name || "";
+      (s.saved.server ? $("jNet") : $("jServer")).focus();
+    }
+    if (s.joined) joinShownFor = null;
+
+    // overall tone = the most "interesting" link state
+    let worst = null;
+    for (const p of peers) if (worst === null || RANK[p.state] > RANK[worst]) worst = p.state;
+    const tone = !s.joined || !worst ? "idle" : TONE[worst];
+    document.body.dataset.tone = tone;
+    const counts = {};
+    for (const p of peers) counts[p.state] = (counts[p.state] || 0) + 1;
+    const summary = Object.entries(counts).sort((a, b) => RANK[b[0]] - RANK[a[0]]).map(([k, v]) => `${v} ${SHORT[k]}`).join(" · ");
+    $("badge").textContent = !s.joined ? "OFFLINE" : peers.length ? summary : "WAITING";
+    document.title = `${$("badge").textContent} · Rendezvous`;
+    $("hdrMeta").innerHTML = s.joined
+      ? `network <b>${esc(s.network)}</b> &nbsp;·&nbsp; you are <b>${esc(s.me.name)}</b>${s.me.vip ? ` &nbsp;·&nbsp; <b>${s.me.vip}</b>` : ""}`
+      : "not connected";
+
+    // stage
+    const key = peers.map((p) => p.id).join(",");
+    if (key !== layoutKey) { layoutKey = key; rebuild(peers); }
+    $("ghost").style.display = peers.length ? "none" : "";
     $("meName").textContent = s.me.name;
-    $("meAddr").textContent = s.me.public !== "-" ? s.me.public : s.me.local;
+    $("meVip").textContent = s.me.vip || (s.joined ? "…" : "");
+    $("meNode").style.setProperty("--sc", `var(${worst ? COLOR[worst] : "--slate"})`);
     $("srvAddr").textContent = s.server + (s.server_ok === false ? "  ✕ unreachable" : "");
     $("serverNode").classList.toggle("down", s.server_ok === false);
-    const p = s.peer;
-    $("peerNode").classList.toggle("absent", !p);
-    $("peerName").textContent = p ? p.name : "waiting…";
-    $("peerAddr").textContent = p ? (s.state === "DIRECT" && s.direct_addr !== "-" ? s.direct_addr : p.public) : "";
+    $("serverNode").classList.toggle("relaying", peers.some((p) => p.state !== "DIRECT"));
+    for (const p of peers) {
+      const nd = nodes[p.id]; if (!nd) continue;
+      nd.g.dataset.state = p.state;
+      nd.g.classList.toggle("blackhole", p.blackhole);
+      nd.n.setAttribute("class", `node pnode s-${p.state}${selected === p.id ? " sel" : ""}`);
+      nd.name.textContent = p.name;
+      nd.vip.textContent = p.vip || "";
+      nd.st.textContent = p.state + (p.rtt_ms != null ? `  ${p.rtt_ms.toFixed(1)} ms` : "");
+    }
 
-    $("capBig").textContent = s.state === "DIRECT" ? "DIRECT" : s.state === "RELAY" ? "RELAY" : s.state;
-    $("capSub").textContent = CAPTIONS[s.state](s);
-    if (s.punch.elapsed != null) $("punchBar").style.width = Math.min(100, 100 * s.punch.elapsed / s.punch.timeout) + "%";
+    // caption
+    const direct = counts.DIRECT || 0, relay = counts.RELAY || 0;
+    if (!s.joined) { $("capBig").textContent = "OFFLINE"; $("capSub").textContent = "Join a network to start."; }
+    else if (!peers.length) {
+      $("capBig").textContent = "WAITING";
+      $("capSub").textContent = s.server_ok === false ? `Rendezvous server ${s.server} is not answering — check the address and that UDP is open.`
+        : `Registered${s.me.public !== "-" ? " as " + s.me.public : ""}. Waiting for other players to join “${s.network}”.`;
+    } else {
+      $("capBig").textContent = `${peers.length} player${peers.length > 1 ? "s" : ""}`;
+      $("capSub").textContent = `${direct} direct (peer-to-peer), ${relay} via relay` +
+        (counts.PUNCHING ? `, ${counts.PUNCHING} punching` : "") + (counts.RECONNECTING ? `, ${counts.RECONNECTING} reconnecting` : "") +
+        ". Each link picks its own path.";
+    }
 
-    // stats
-    const pathCls = s.path ? "path-" + s.path : "";
-    $("rttVal").className = "v " + (s.rtt_path ? "path-" + s.rtt_path : "");
-    $("rttVal").innerHTML = s.rtt_ms != null ? `${s.rtt_ms.toFixed(s.rtt_ms < 10 ? 2 : 1)} <small>ms</small>` : "–";
-    $("rttPathLbl").textContent = s.rtt_path ? `· via ${s.rtt_path}` : "";
-    $("pathVal").className = "v " + pathCls;
-    $("pathVal").textContent = s.path ? s.path.toUpperCase() : "none";
-    $("sinceVal").textContent = s.in_state_s < 60 ? s.in_state_s.toFixed(0) + "s" : Math.floor(s.in_state_s / 60) + "m " + Math.floor(s.in_state_s % 60) + "s";
-    const st = s.stats || {};
-    $("txVal").textContent = bytes(st.tx_bytes);
-    $("rxVal").textContent = bytes(st.rx_bytes);
-    $("txVal").title = `direct ${bytes(st.tx_direct_bytes)} · relay ${bytes(st.tx_relay_bytes)}`;
-    $("rxVal").title = `direct ${bytes(st.rx_direct_bytes)} · relay ${bytes(st.rx_relay_bytes)}`;
-    $("pktVal").textContent = `${st.tx_packets || 0} / ${st.rx_packets || 0}`;
-    $("punchVal").innerHTML = (s.state === "PUNCHING" || s.state === "RECONNECTING")
-      ? `${s.punch.round} <small>/ ${s.punch.total}</small>`
-      : `${s.punch.total}`;
-    $("punchVal").title = "this round / total punch attempts";
+    // side: this PC
+    $("myIp").innerHTML = s.me.vip ? `${s.me.vip} <small>VIRTUAL IP</small>` : (s.joined ? "…" : "–");
+    const v = s.vnet;
+    $("vstatus").className = "vstatus " + v.status;
+    $("vstatus").textContent = v.status === "up" ? `Virtual LAN up · ${v.detail}`
+      : v.status === "error" ? `Virtual LAN unavailable: ${v.detail}` : v.detail;
+    $("kNet").textContent = s.joined ? s.network : "-";
+    $("kPub").textContent = s.me.public;
+    $("kSrv").textContent = s.server + (s.server_ok ? "  ✓" : s.server_ok === false ? "  ✕" : "");
+    $("leaveBtn").hidden = !s.joined;
+    $("quitBtn").hidden = !s.app_mode;
 
-    const sil = s.direct_silence_s;
-    const watching = s.peer && (s.state === "DIRECT" || s.state === "RECONNECTING");
-    $("silenceLbl").textContent = watching && sil != null ? `${sil.toFixed(1)}s ago (dead after ${s.dead_after}s)` : "– (not on direct path)";
-    const frac = watching && sil != null ? Math.min(1, sil / s.dead_after) : 0;
-    $("silenceBar").style.width = (frac * 100) + "%";
-    $("silenceBar").style.background = frac > .7 ? "var(--red)" : frac > .4 ? "var(--amber)" : "var(--green)";
+    // side: players
+    $("pcount").textContent = peers.length ? `(${peers.length})` : "";
+    renderCards(peers, s);
+    $("hint").innerHTML = !s.joined ? "" : v.status === "up"
+      ? `<b>To play:</b> host a LAN game on one PC; the others find it in their LAN list, or connect to the host's <b>10.x</b> address.`
+      : v.enabled ? "The tunnel works without the virtual LAN, but games won't see each other until the adapter is up."
+      : "Demo mode (no virtual adapter). Start with <b>--vlan</b> as administrator, or use the app, to play LAN games.";
+    $("hint").hidden = !s.joined;
 
-    $("eMePub").textContent = s.me.public;
-    $("eMeLoc").textContent = s.me.local;
-    $("ePeerPub").textContent = p ? p.public : "-";
-    $("ePeerLoc").textContent = p ? p.local : "-";
-    $("eDirect").textContent = s.state === "DIRECT" ? s.direct_addr : "-";
-    $("eSrv").textContent = s.server + (s.server_ok ? "  ✓" : s.server_ok === false ? "  ✕" : "");
-
-    // controls
-    for (const b of document.querySelectorAll(".btns button")) b.disabled = !p;
-    const flags = [];
-    if (s.forced_relay) flags.push('<span class="flag relay">RELAY FORCED</span>');
-    if (s.blackhole) flags.push('<span class="flag drop">DIRECT PATH DROPPED</span>');
-    $("flags").innerHTML = flags.join("");
-
-    drawSpark(s.rtt_history || []);
-    prevState = s.state;
+    for (const b of document.querySelectorAll("header .btns button")) b.disabled = !peers.length;
   }
 
-  // RTT sparkline, coloured by the path each sample travelled.
-  function drawSpark(hist) {
-    const c = $("spark"), dpr = window.devicePixelRatio || 1;
-    const w = c.clientWidth, h = c.clientHeight;
+  function renderCards(peers, s) {
+    const box = $("peers");
+    if (!peers.length) { box.innerHTML = `<div class="empty">${s.joined ? "No other players yet." : "Not connected."}</div>`; return; }
+    const ids = peers.map((p) => p.id).join(",");
+    if (box.dataset.ids !== ids) {
+      box.dataset.ids = ids;
+      box.innerHTML = peers.map((p) => `
+        <div class="pcard" data-id="${p.id}">
+          <div class="top"><span class="nm"></span><span class="ip"></span><span class="chip"></span></div>
+          <div class="nums">
+            <div class="rtt">RTT<b></b></div><div>Out<b class="o"></b></div><div>In<b class="i"></b></div>
+          </div>
+          <div class="more" hidden>
+            <canvas></canvas>
+            <div class="meter" title="direct keepalive: time since last direct packet"><i></i></div>
+            <div class="detail"></div>
+            <div class="acts">
+              <button class="b-relay" data-cmd="force_relay">Force relay</button>
+              <button class="b-punch" data-cmd="repunch">Re-punch</button>
+              <button class="b-drop" data-cmd="drop_direct">Drop direct</button>
+            </div>
+          </div>
+        </div>`).join("");
+      for (const c of box.querySelectorAll(".pcard")) {
+        c.addEventListener("click", (e) => {
+          const b = e.target.closest("button");
+          if (b) { send({ cmd: b.dataset.cmd, peer: c.dataset.id }); e.stopPropagation(); return; }
+          select(c.dataset.id);
+        });
+      }
+    }
+    for (const p of peers) {
+      const c = box.querySelector(`.pcard[data-id="${p.id}"]`);
+      c.className = `pcard s-${p.state}${selected === p.id ? " sel" : ""}`;
+      c.querySelector(".nm").textContent = p.name;
+      c.querySelector(".ip").textContent = p.vip || "";
+      c.querySelector(".chip").textContent = p.state + (p.forced_relay ? " (forced)" : "") + (p.blackhole ? " · DROPPED" : "");
+      const rt = c.querySelector(".rtt b");
+      rt.textContent = p.rtt_ms != null ? `${p.rtt_ms.toFixed(p.rtt_ms < 10 ? 2 : 1)} ms` : "–";
+      c.querySelector(".rtt").style.setProperty("--rc", p.rtt_path === "direct" ? "var(--green)" : p.rtt_path === "relay" ? "var(--amber)" : "var(--text)");
+      c.querySelector(".o").textContent = bytes(p.stats.tx_bytes);
+      c.querySelector(".i").textContent = bytes(p.stats.rx_bytes);
+      const more = c.querySelector(".more");
+      more.hidden = selected !== p.id && peers.length > 1;
+      if (!more.hidden) {
+        drawSpark(c.querySelector("canvas"), p.rtt_history);
+        const watching = p.state === "DIRECT" || p.state === "RECONNECTING";
+        const frac = watching && p.direct_silence_s != null ? Math.min(1, p.direct_silence_s / s.dead_after) : 0;
+        const m = c.querySelector(".meter i");
+        m.style.width = frac * 100 + "%";
+        m.style.background = frac > .7 ? "var(--red)" : frac > .4 ? "var(--amber)" : "var(--green)";
+        const st = p.stats;
+        c.querySelector(".detail").innerHTML =
+          `public ${esc(p.public)} · local ${esc(p.local)}<br>` +
+          (p.state === "DIRECT" ? `direct via ${esc(p.direct_addr)}` : `relayed by server`) +
+          ` · punches ${p.punch.total}` + (p.punch.elapsed != null ? ` (round ${p.punch.round}, ${p.punch.elapsed.toFixed(1)}s/${s.punch_timeout}s)` : "") +
+          `<br>LAN packets out/in ${st.vlan_tx_packets || 0} / ${st.vlan_rx_packets || 0}` +
+          (watching && p.direct_silence_s != null ? ` · last direct ${p.direct_silence_s.toFixed(1)}s ago` : "");
+      }
+    }
+  }
+
+  function drawSpark(c, hist) {
+    const dpr = window.devicePixelRatio || 1, w = c.clientWidth, h = c.clientHeight;
+    if (!w) return;
     if (c.width !== w * dpr) { c.width = w * dpr; c.height = h * dpr; }
     const g = c.getContext("2d");
-    g.setTransform(dpr, 0, 0, dpr, 0, 0);
-    g.clearRect(0, 0, w, h);
-    if (hist.length < 2) return;
+    g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
+    if (!hist || hist.length < 2) return;
     const css = getComputedStyle(document.documentElement);
     const col = { direct: css.getPropertyValue("--green"), relay: css.getPropertyValue("--amber") };
     const max = Math.max(1, ...hist.map((x) => x[1])) * 1.15;
     const n = 60, step = w / (n - 1), off = n - hist.length;
-    const X = (i) => (i + off) * step, Y = (v) => h - 16 - (v / max) * (h - 20);
-    g.lineWidth = 2.5; g.lineJoin = "round"; g.lineCap = "round";
+    const X = (i) => (i + off) * step, Y = (v) => h - 3 - (v / max) * (h - 8);
+    g.lineWidth = 2; g.lineJoin = "round"; g.lineCap = "round";
     for (let i = 1; i < hist.length; i++) {
       g.strokeStyle = col[hist[i][2]] || "#888";
       g.beginPath(); g.moveTo(X(i - 1), Y(hist[i - 1][1])); g.lineTo(X(i), Y(hist[i][1])); g.stroke();
     }
-    g.fillStyle = css.getPropertyValue("--muted"); g.font = "11px system-ui"; g.textAlign = "right";
-    g.fillText(`peak ${(max / 1.15).toFixed(2)} ms`, w - 2, h - 1);
   }
 
   // ------------------------------------------------------------ animations
   function animate(pathEl, from, to, dur, cls, r, onEnd) {
     const len = pathEl.getTotalLength();
-    const c = document.createElementNS(NS, "circle");
-    c.setAttribute("r", r); c.setAttribute("class", "pkt " + cls);
-    $("pkts").appendChild(c);
+    const c = el("circle", { r, class: "pkt " + cls }, $("pkts"));
     const t0 = performance.now();
     (function step(t) {
       const k = Math.min(1, (t - t0) / dur);
@@ -477,9 +582,8 @@
     })(t0);
   }
   function burst(x, y, color, r0 = 6, r1 = 30, dur = 500) {
-    const c = document.createElementNS(NS, "circle");
-    c.setAttribute("cx", x); c.setAttribute("cy", y); c.setAttribute("class", "burst"); c.style.stroke = color;
-    $("pkts").appendChild(c);
+    const c = el("circle", { cx: x, cy: y, class: "burst" }, $("pkts"));
+    c.style.stroke = color;
     const t0 = performance.now();
     (function step(t) {
       const k = Math.min(1, (t - t0) / dur);
@@ -487,56 +591,58 @@
       if (k < 1) requestAnimationFrame(step); else c.remove();
     })(t0);
   }
-  const DROP_AT = 0.5;  // the X marker sits in the middle of the direct line
+  const peerOf = (id) => S && (S.peers || []).find((p) => p.id === id);
   function pulse(m) {
-    if (!S || !m.path || document.hidden) return;
-    const el = $("p-" + m.path);
+    const nd = nodes[m.peer], p = peerOf(m.peer);
+    if (!nd || !p || !m.path || document.hidden) return;
+    const path = m.path === "direct" ? nd.dPath : nd.rPath;
     const dur = m.path === "direct" ? 650 : 1000;
-    const r = m.big ? 12 : 7;
-    if (m.path === "direct" && S.blackhole) {
-      const [a, b] = m.dir === "out" ? [0, DROP_AT] : [1, DROP_AT];
-      animate(el, a, b, dur / 2, "dead", r, (pt) => burst(pt.x, pt.y, "var(--red)"));
+    const r = m.big ? 11 : m.data ? 5 : 6.5;
+    const cls = m.path + (m.data ? " data" : "");
+    if (m.path === "direct" && p.blackhole) {
+      animate(path, m.dir === "out" ? 0 : 1, .5, dur / 2, "dead", r, (pt) => burst(pt.x, pt.y, "var(--red)"));
       return;
     }
-    animate(el, m.dir === "out" ? 0 : 1, m.dir === "out" ? 1 : 0, dur, m.path, r);
+    animate(path, m.dir === "out" ? 0 : 1, m.dir === "out" ? 1 : 0, dur, cls, r);
   }
-  function punch() {
-    if (document.hidden) return;
-    const el = $("p-direct");
-    const color = S && S.state === "RECONNECTING" ? "var(--red)" : "var(--cyan)";
-    animate(el, 0, S && S.blackhole ? DROP_AT : 0.42, 420, S && S.blackhole ? "dead" : "punch", 7,
-            (pt) => burst(pt.x, pt.y, color, 4, 22, 400));
+  function punch(m) {
+    const nd = nodes[m.peer], p = peerOf(m.peer);
+    if (!nd || !p || document.hidden) return;
+    const color = p.state === "RECONNECTING" ? "var(--red)" : "var(--cyan)";
+    animate(nd.dPath, 0, p.blackhole ? .5 : .42, 420, p.blackhole ? "dead" : "punch", 6,
+            (pt) => burst(pt.x, pt.y, color, 4, 20, 400));
   }
   let bannerTimer = null;
   function transition(m) {
     const b = $("banner");
-    b.style.setProperty("--bc", `var(${COLORS[m.to]})`);
-    b.textContent = `${m.from} → ${m.to}`;
+    b.style.setProperty("--bc", `var(${COLOR[m.to] || "--slate"})`);
+    b.textContent = `${m.name}: ${m.from} → ${m.to}`;
     b.classList.add("show");
     clearTimeout(bannerTimer);
     bannerTimer = setTimeout(() => b.classList.remove("show"), 2200);
-    if (m.to === "DIRECT") { burst(150, 330, "var(--green)", 60, 110, 800); burst(850, 330, "var(--green)", 60, 110, 800); }
-    if (m.to === "RELAY") burst(500, 110, "var(--amber)", 40, 140, 800);
-    if (m.to === "RECONNECTING") burst(500, 330, "var(--red)", 10, 90, 700);
+    const nd = nodes[m.peer];
+    if (!nd) return;
+    if (m.to === "DIRECT") { burst(ME.x, ME.y, "var(--green)", 62, 110, 800); burst(nd.x, nd.y, "var(--green)", nd.r, nd.r + 50, 800); }
+    if (m.to === "RELAY") burst(SRV.x, SRV.y - 30, "var(--amber)", 40, 130, 800);
+    if (m.to === "RECONNECTING") burst(nd.mid[0], nd.mid[1], "var(--red)", 10, 80, 700);
   }
 
   // ------------------------------------------------------------ event log
+  let stickLog = true;
   function addEvent(ev) {
     if (seenEvents.has(ev.id)) return;
     seenEvents.add(ev.id);
     const ul = $("events");
     const li = document.createElement("li");
-    const isTrans = /^[A-Z]+ -> [A-Z]+:/.test(ev.msg);
-    const isPunch = /^punch attempt/.test(ev.msg);
+    const isTrans = / [A-Z]+ -> [A-Za-z]+:/.test(" " + ev.msg.replace(/^\[[^\]]*\] /, ""));
+    const isPunch = /punch attempt/.test(ev.msg);
     li.className = ev.level + (isTrans ? " transition" : "") + (isPunch ? " punch" : "");
     if (isPunch && !$("showPunch").checked) li.hidden = true;
     li.innerHTML = `<time>${hms(ev.ts)}</time><span>${esc(ev.msg).replace(/ -&gt; /g, " → ")}</span>`;
     ul.appendChild(li);
-    while (ul.children.length > 400) ul.firstChild.remove();
+    while (ul.children.length > 500) ul.firstChild.remove();
     if (stickLog) ul.scrollTop = ul.scrollHeight;
   }
-  // Follow the newest event unless the user scrolled up to read history.
-  let stickLog = true;
   $("events").addEventListener("scroll", (e) => {
     const ul = e.target; stickLog = ul.scrollHeight - ul.scrollTop - ul.clientHeight < 40;
   });
@@ -547,15 +653,16 @@
   });
 
   // ----------------------------------------------------------------- chat
+  function chatEmpty() { $("msgs").innerHTML = '<div class="empty">Messages travel through the tunnel to every player, on each link\'s active path.</div>'; }
   function addChat(m) {
-    $("chatEmpty")?.remove();
-    const box = $("msgs");
+    $("msgs").querySelector(".empty")?.remove();
     const d = document.createElement("div");
     d.className = "msg" + (m.mine ? " mine" : "");
-    const chip = m.path ? `<span class="chip ${m.path}">${m.path.toUpperCase()}</span>` : "";
+    const title = m.paths ? Object.entries(m.paths).map(([k, v]) => `${k}: ${v}`).join(", ") : "";
+    const chip = m.path ? `<span class="chip ${m.path}" title="${esc(title)}">${m.path.toUpperCase()}</span>` : "";
     d.innerHTML = `<div class="who">${esc(m.who)} · ${hms(m.ts).slice(0, 8)} ${chip}</div><div class="text">${esc(m.text)}</div>`;
-    box.appendChild(d);
-    box.scrollTop = box.scrollHeight;
+    $("msgs").appendChild(d);
+    $("msgs").scrollTop = $("msgs").scrollHeight;
   }
   $("chatForm").addEventListener("submit", (e) => {
     e.preventDefault();
@@ -569,11 +676,22 @@
     ws.send(JSON.stringify(obj));
     return true;
   }
-  for (const b of document.querySelectorAll(".btns button")) b.addEventListener("click", () => send({ cmd: b.dataset.cmd }));
+  for (const b of document.querySelectorAll("header .btns button")) b.addEventListener("click", () => send({ cmd: b.dataset.cmd }));
   document.addEventListener("keydown", (e) => {
-    if (e.target.tagName === "INPUT" || e.ctrlKey || e.metaKey || e.altKey) return;
-    const k = { r: "bRelay", p: "bPunch", d: "bDrop" }[e.key.toLowerCase()];
-    if (k && !$(k).disabled) { $(k).click(); $(k).focus(); }
+    if (e.target.tagName === "INPUT" || e.ctrlKey || e.metaKey || e.altKey || !S || !S.joined) return;
+    const cmd = { r: "force_relay", p: "repunch", d: "drop_direct" }[e.key.toLowerCase()];
+    if (cmd && S.peers.length) send({ cmd });
+  });
+  $("leaveBtn").addEventListener("click", () => send({ cmd: "leave" }));
+  $("quitBtn").addEventListener("click", () => { send({ cmd: "quit" }); setTimeout(() => window.close(), 300); });
+  $("myIp").addEventListener("click", () => { if (S && S.me.vip) navigator.clipboard?.writeText(S.me.vip); });
+  $("joinForm").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const server = $("jServer").value.trim();
+    if (!/^[^\s:]+(:\d+)?$/.test(server)) { $("joinErr").textContent = "Server should look like 203.0.113.10:9000"; return; }
+    $("joinErr").textContent = "";
+    send({ cmd: "join", server: server.includes(":") ? server : server + ":9000", network: $("jNet").value.trim(),
+           password: $("jPass").value, name: $("jName").value.trim() });
   });
 
   // ------------------------------------------------------------ websocket
@@ -581,28 +699,29 @@
     ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
     ws.onopen = () => { $("live").classList.add("on"); $("live").querySelector("span").textContent = "live"; };
     ws.onclose = () => {
-      $("live").classList.remove("on"); $("live").querySelector("span").textContent = "peer process offline — retrying";
+      $("live").classList.remove("on"); $("live").querySelector("span").textContent = "app not running — retrying";
       setTimeout(connect, 1000);
     };
     ws.onmessage = (e) => {
       const m = JSON.parse(e.data);
       switch (m.type) {
         case "hello":
-          $("events").innerHTML = ""; seenEvents.clear();
-          m.events.forEach(addEvent);
-          $("msgs").innerHTML = ""; m.chat.forEach(addChat);
-          if (!m.chat.length) $("msgs").innerHTML = '<div class="empty" id="chatEmpty">Messages typed here travel through the tunnel on the active path.</div>';
+          $("events").innerHTML = ""; seenEvents.clear(); m.events.forEach(addEvent);
+          chatEmpty(); m.chat.forEach(addChat);
           break;
         case "state": render(m); break;
-        case "event": addEvent(m); break;
+        case "event":
+          addEvent(m);
+          if (m.level === "bad" && /server error/.test(m.msg) && S && !S.peers.length) $("joinErr").textContent = m.msg;
+          break;
         case "chat": addChat(m); break;
         case "transition": transition(m); break;
         case "pulse": pulse(m); break;
-        case "punch": punch(); break;
+        case "punch": punch(m); break;
       }
     };
   }
-  window.addEventListener("resize", () => S && drawSpark(S.rtt_history || []));
+  chatEmpty();
   connect();
 })();
 </script>

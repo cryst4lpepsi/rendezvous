@@ -1,0 +1,65 @@
+name: Windows app
+
+on:
+  push:
+    branches: [main, "claude/**"]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    env:
+      WINTUN_SHA256: 07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt pyinstaller
+
+      - name: Download Wintun driver (hash-checked)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://www.wintun.net/builds/wintun-0.14.1.zip -OutFile wintun.zip
+          $hash = (Get-FileHash wintun.zip -Algorithm SHA256).Hash.ToLower()
+          Write-Host "wintun.zip sha256 = $hash"
+          if ($hash -ne $env:WINTUN_SHA256) { throw "Wintun hash mismatch" }
+          Expand-Archive wintun.zip -DestinationPath wintun-dl
+          Copy-Item wintun-dl/wintun/bin/amd64/wintun.dll .
+
+      - name: Build Rendezvous.exe
+        run: >
+          pyinstaller --noconfirm --onefile --windowed --uac-admin --name Rendezvous
+          --add-data "dashboard.html;." --add-binary "wintun.dll;."
+          --hidden-import vnet --collect-submodules uvicorn --collect-submodules websockets
+          app.py
+
+      - name: Build Rendezvous-console.exe (same app, shows its log in a console)
+        run: >
+          pyinstaller --noconfirm --onefile --console --uac-admin --name Rendezvous-console
+          --add-data "dashboard.html;." --add-binary "wintun.dll;."
+          --hidden-import vnet --collect-submodules uvicorn --collect-submodules websockets
+          app.py
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory release | Out-Null
+          Copy-Item dist/Rendezvous.exe, dist/Rendezvous-console.exe, rendezvous_server.py, README.md release/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Rendezvous-windows
+          path: release/
+
+      - name: Test - Wintun adapter on real Windows
+        if: always()
+        run: python tools/wintun_smoke.py
+
+      - name: Test - mesh on Windows loopback + the built exe
+        if: always()
+        run: python tools/ci_loopback_test.py --exe dist/Rendezvous-console.exe

@@ -3,30 +3,39 @@
 rendezvous_server.py - the "introducer" and fallback relay.
 
 WHY A SERVER AT ALL?
-  Two machines behind home routers (NATs) cannot simply connect to each other:
-  neither knows the other's PUBLIC address, and each NAT drops unsolicited
-  inbound packets. So both peers first talk OUT to this server, which has a
-  public IP. When a UDP packet leaves a NAT, the NAT creates a temporary
-  mapping  (private ip:port) <-> (public ip:port).  The server sees the packet
-  arrive from that PUBLIC ip:port, which is exactly the address the other peer
-  needs to aim at. The server just tells each peer the other's public
-  endpoint ("introduction"), and the peers then try to punch a hole directly.
+  Machines behind home routers (NATs) cannot simply connect to each other:
+  none of them knows the others' PUBLIC address, and each NAT drops
+  unsolicited inbound packets. So every peer first talks OUT to this server,
+  which has a public IP. When a UDP packet leaves a NAT, the NAT creates a
+  temporary mapping  (private ip:port) <-> (public ip:port).  The server sees
+  the packet arrive from that PUBLIC ip:port, which is exactly the address the
+  other peers need to aim at. The server tells every peer in a room about every
+  other peer ("introduction"), and each pair then tries to punch a hole.
 
-  If direct punching fails (e.g. symmetric NAT, strict firewall), the server
-  also acts as a RELAY: a peer wraps a packet in {"t":"relay", ...}, the server
-  unwraps it and forwards it to the other peer in the same room. This always
-  works because both peers already have an open NAT mapping towards the server
-  (kept alive by re-registering every couple of seconds).
+  If direct punching fails for a pair (symmetric NAT, strict firewall), the
+  server also acts as a RELAY for that pair: it forwards packets between them.
+  This always works because every peer already has an open NAT mapping towards
+  the server (kept alive by re-registering every couple of seconds).
 
-PROTOCOL (JSON over UDP, one message per datagram)
-  peer -> server  {"t":"register", "room", "id", "name", "local":[ip,port]}
-  server -> peer  {"t":"registered", "public":[ip,port]}   <- your public endpoint
-  server -> peer  {"t":"peer", "id", "name", "public", "local"} <- the other peer
-  server -> peer  {"t":"peer_left", "id"}
-  peer -> server  {"t":"relay", "room", "from", "inner":{...}}
-  server -> peer  {"t":"relayed", "from", "inner":{...}}
-  peer -> server  {"t":"bye", "room", "id"}
-  server -> peer  {"t":"error", "reason"}
+  The server also hands out a VIRTUAL IP (10.77.0.x by default) to each peer in
+  a room. Those are the addresses of the virtual LAN adapters.
+
+PROTOCOL
+  Control messages are JSON, one per datagram (first byte is "{"):
+    peer -> server  {"t":"register", "room", "id", "name", "local":[ip,port], "want_ip"}
+    server -> peer  {"t":"registered", "public":[ip,port], "vip", "prefix"}
+    server -> peer  {"t":"peer", "id", "name", "public", "local", "vip"}  <- one per other peer
+    server -> peer  {"t":"peer_left", "id"}
+    peer -> server  {"t":"relay", "room", "from", "to", "inner":{...}}
+    server -> peer  {"t":"relayed", "from", "inner":{...}}
+    peer -> server  {"t":"bye", "room", "id"}
+    server -> peer  {"t":"error", "reason"}
+
+  Virtual-LAN data is binary, to keep it small and fast (no JSON, no base64):
+    peer -> server  0x02 | to_id (3 bytes) | ip packet
+    server -> peer  0x03 | from_id (3 bytes) | ip packet
+  The server works out who sent a 0x02 packet from its source address, so a
+  packet can only be relayed on behalf of a registered peer.
 
 Also serves a tiny read-only HTTP status page (JSON) for debugging.
 
@@ -34,6 +43,7 @@ Pure standard library: copy this single file to any box with Python 3.8+ and run
 """
 
 import argparse
+import ipaddress
 import json
 import logging
 import socket
@@ -45,8 +55,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 log = logging.getLogger("server")
 
 PEER_TIMEOUT = 10.0     # seconds without a register/relay before a peer is forgotten
-MAX_PEERS_PER_ROOM = 2  # this tool is strictly point-to-point
+MAX_PEERS_PER_ROOM = 8
 MAX_DATAGRAM = 65535
+
+BIN_RELAY = 0x02        # peer -> server
+BIN_RELAYED = 0x03      # server -> peer
 
 
 def disable_udp_connreset(sock):
@@ -89,16 +102,18 @@ def make_udp_socket(host, port):
 
 
 class PeerRecord:
-    def __init__(self, pid, name, public, local):
+    def __init__(self, pid, name, public, local, vip):
         self.id = pid
+        self.raw_id = bytes.fromhex(pid)  # 3 bytes, used in binary frames
         self.name = name
         self.public = public            # (ip, port) as WE observe it = their NAT's public mapping
         self.local = local              # (ip, port) the peer reports for itself (LAN address)
+        self.vip = vip                  # virtual LAN address we assigned
         self.first_seen = time.time()
         self.last_seen = time.time()
 
     def info(self):
-        return {"t": "peer", "id": self.id, "name": self.name,
+        return {"t": "peer", "id": self.id, "name": self.name, "vip": self.vip,
                 "public": list(self.public), "local": list(self.local) if self.local else None}
 
 
@@ -112,42 +127,58 @@ class Room:
     def others(self, pid):
         return [p for p in self.peers.values() if p.id != pid]
 
+    def by_raw_id(self, raw):
+        for p in self.peers.values():
+            if p.raw_id == raw:
+                return p
+        return None
+
 
 class RendezvousServer:
-    def __init__(self, host, port):
+    def __init__(self, host, port, subnet):
         self.sock = make_udp_socket(host, port)
+        self.subnet = ipaddress.ip_network(subnet)
         self.rooms = {}
+        self.by_addr = {}  # public (ip, port) -> (Room, PeerRecord), for binary relay
         self.lock = threading.Lock()   # the HTTP status thread reads self.rooms
         self.started = time.time()
         self._last_expire = 0.0
 
     # ------------------------------------------------------------------ io
     def send(self, msg, addr):
+        self.send_raw(json.dumps(msg, separators=(",", ":")).encode(), addr)
+
+    def send_raw(self, data, addr):
         try:
-            self.sock.sendto(json.dumps(msg, separators=(",", ":")).encode(), addr)
+            self.sock.sendto(data, addr)
         except OSError as e:
             log.debug("send to %s failed: %s", addr, e)
 
     def serve_forever(self):
         self.sock.settimeout(1.0)
-        log.info("UDP rendezvous/relay listening on %s:%d", *self.sock.getsockname())
+        log.info("UDP rendezvous/relay listening on %s:%d, virtual LAN %s",
+                 *self.sock.getsockname(), self.subnet)
         while True:
             try:
                 data, addr = self.sock.recvfrom(MAX_DATAGRAM)
             except socket.timeout:
-                self.expire()
+                with self.lock:
+                    self.expire()
                 continue
             except ConnectionResetError:
                 continue  # stray ICMP on Windows; harmless
-            try:
-                msg = json.loads(data)
-                if not isinstance(msg, dict):
-                    raise ValueError("not an object")
-            except ValueError:
-                log.debug("drop: non-JSON datagram from %s", addr)
-                continue
             with self.lock:
-                self.handle(msg, addr, len(data))
+                if data and data[0] == BIN_RELAY:
+                    self.on_binary_relay(data, addr)
+                else:
+                    try:
+                        msg = json.loads(data)
+                        if not isinstance(msg, dict):
+                            raise ValueError("not an object")
+                    except ValueError:
+                        log.debug("drop: unparseable datagram from %s", addr)
+                        continue
+                    self.handle(msg, addr, len(data))
                 self.expire()
 
     # ------------------------------------------------------------ handlers
@@ -162,10 +193,25 @@ class RendezvousServer:
         else:
             log.debug("drop: unknown message type %r from %s", t, addr)
 
+    def assign_vip(self, room, want):
+        """Hand out the lowest free host address, or the one the peer asks for
+        (it remembers its last address so players keep the same IP)."""
+        taken = {p.vip for p in room.peers.values()}
+        hosts = [str(h) for h in self.subnet.hosts()]
+        if want in hosts and want not in taken:
+            return want
+        for h in hosts:
+            if h not in taken:
+                return h
+        return None
+
     def on_register(self, msg, addr):
         code, pid = str(msg.get("room", "")), str(msg.get("id", ""))
-        if not code or not pid:
-            return self.send({"t": "error", "reason": "register needs room and id"}, addr)
+        try:
+            if not code or len(bytes.fromhex(pid)) != 3:
+                raise ValueError
+        except ValueError:
+            return self.send({"t": "error", "reason": "register needs a room and a 6-hex-digit id"}, addr)
         local = tuple(msg["local"]) if msg.get("local") else None
         room = self.rooms.setdefault(code, Room(code))
         rec = room.peers.get(pid)
@@ -173,49 +219,79 @@ class RendezvousServer:
         if rec is None:
             if len(room.peers) >= MAX_PEERS_PER_ROOM:
                 log.warning("room %r full, rejecting %s from %s", code, pid, addr)
-                return self.send({"t": "error", "reason": f"room '{code}' already has 2 peers"}, addr)
-            rec = room.peers[pid] = PeerRecord(pid, str(msg.get("name") or pid), addr, local)
-            log.info("[%s] REGISTER %s (%s) public=%s:%d local=%s",
-                     code, rec.name, pid, addr[0], addr[1], local)
+                return self.send({"t": "error", "reason": f"network is full ({MAX_PEERS_PER_ROOM} players)"}, addr)
+            vip = self.assign_vip(room, msg.get("want_ip"))
+            rec = room.peers[pid] = PeerRecord(pid, str(msg.get("name") or pid)[:32], addr, local, vip)
+            self.by_addr[addr] = (room, rec)
+            log.info("[%s] REGISTER %s (%s) public=%s:%d local=%s vip=%s",
+                     code, rec.name, pid, addr[0], addr[1], local, vip)
             changed = True
         else:
             # Same peer re-registering (keepalive). If its public address moved,
-            # its NAT re-mapped it (or it switched networks) - tell the other side.
+            # its NAT re-mapped it (or it switched networks) - tell the others.
             changed = rec.public != addr or rec.local != local
             if changed:
                 log.info("[%s] %s endpoint changed %s -> %s", code, rec.name, rec.public, addr)
+                self.by_addr.pop(rec.public, None)
+                self.by_addr[addr] = (room, rec)
             rec.public, rec.local = addr, local
             rec.last_seen = time.time()
             log.debug("[%s] keepalive register from %s", code, rec.name)
 
-        # Tell the peer what its public endpoint looks like from the outside.
-        self.send({"t": "registered", "public": list(addr), "room": code}, addr)
+        # Tell the peer what its public endpoint looks like from the outside,
+        # and which virtual IP it owns.
+        self.send({"t": "registered", "public": list(addr), "room": code,
+                   "vip": rec.vip, "prefix": self.subnet.prefixlen}, addr)
 
-        # Introduction: give each peer the other's endpoints. We re-send the
-        # other peer's info on every register so a lost packet is self-healing.
+        # Introduction: give each peer every other peer's endpoints. We re-send
+        # on every register so a lost packet is self-healing.
         for other in room.others(pid):
             self.send(other.info(), addr)
             if changed:
                 log.info("[%s] INTRODUCE %s <-> %s", code, rec.name, other.name)
                 self.send(rec.info(), other.public)
 
-    def on_relay(self, msg, addr, size):
-        code, pid = str(msg.get("room", "")), str(msg.get("from", ""))
+    def _sender(self, code, pid, addr):
         room = self.rooms.get(code)
         sender = room.peers.get(pid) if room else None
         # Simple anti-abuse check: only relay for a registered peer, and only
         # if the packet really comes from the address it registered from.
         if sender is None or sender.public != addr:
-            log.debug("drop relay: %s from %s is not a registered peer of room %r", pid, addr, code)
-            return
+            return None, None
         sender.last_seen = time.time()
-        out = {"t": "relayed", "from": pid, "inner": msg.get("inner")}
-        for other in room.others(pid):
-            self.send(out, other.public)
+        return room, sender
+
+    def on_relay(self, msg, addr, size):
+        room, sender = self._sender(str(msg.get("room", "")), str(msg.get("from", "")), addr)
+        if sender is None:
+            log.debug("drop relay from %s: not a registered peer", addr)
+            return
+        out = json.dumps({"t": "relayed", "from": sender.id, "inner": msg.get("inner")},
+                         separators=(",", ":")).encode()
+        to = msg.get("to")
+        targets = [room.peers[to]] if to in room.peers else ([] if to else room.others(sender.id))
+        for other in targets:
+            if other.id == sender.id:
+                continue
+            self.send_raw(out, other.public)
             room.relayed_packets += 1
             room.relayed_bytes += size
-            log.debug("[%s] RELAY %d bytes %s -> %s (%s)", code, size, sender.name, other.name,
+            log.debug("[%s] RELAY %d bytes %s -> %s (%s)", room.code, size, sender.name, other.name,
                       (msg.get("inner") or {}).get("t"))
+
+    def on_binary_relay(self, data, addr):
+        entry = self.by_addr.get(addr)
+        if entry is None or len(data) < 5:
+            log.debug("drop binary relay from %s: not a registered peer", addr)
+            return
+        room, sender = entry
+        sender.last_seen = time.time()
+        target = room.by_raw_id(data[1:4])
+        if target is None or target is sender:
+            return
+        self.send_raw(bytes([BIN_RELAYED]) + sender.raw_id + data[4:], target.public)
+        room.relayed_packets += 1
+        room.relayed_bytes += len(data)
 
     def on_bye(self, msg, addr):
         code, pid = str(msg.get("room", "")), str(msg.get("id", ""))
@@ -226,6 +302,8 @@ class RendezvousServer:
     # ---------------------------------------------------------- lifecycle
     def remove(self, room, pid, why):
         rec = room.peers.pop(pid)
+        if self.by_addr.get(rec.public, (None, None))[1] is rec:
+            del self.by_addr[rec.public]
         log.info("[%s] LEAVE %s (%s)", room.code, rec.name, why)
         for other in room.peers.values():
             self.send({"t": "peer_left", "id": pid}, other.public)
@@ -246,11 +324,13 @@ class RendezvousServer:
         with self.lock:
             return {
                 "uptime_s": round(time.time() - self.started),
+                "subnet": str(self.subnet),
                 "rooms": {
-                    code: {
+                    # room codes double as passwords, so only show the network name part
+                    code.split("/")[0]: {
                         "relayed_packets": r.relayed_packets,
                         "relayed_bytes": r.relayed_bytes,
-                        "peers": [{"id": p.id, "name": p.name, "public": "%s:%d" % p.public,
+                        "peers": [{"id": p.id, "name": p.name, "vip": p.vip, "public": "%s:%d" % p.public,
                                    "local": "%s:%d" % p.local if p.local else None,
                                    "last_seen_s_ago": round(time.time() - p.last_seen, 1)}
                                   for p in r.peers.values()],
@@ -282,12 +362,13 @@ def main():
     ap.add_argument("--host", default="0.0.0.0", help="bind address (default 0.0.0.0)")
     ap.add_argument("--port", type=int, default=9000, help="UDP port (default 9000)")
     ap.add_argument("--http-port", type=int, default=9001, help="HTTP status port (default 9001, 0 = off)")
+    ap.add_argument("--subnet", default="10.77.0.0/24", help="virtual LAN subnet (default 10.77.0.0/24)")
     ap.add_argument("--verbose", "-v", action="store_true", help="log every packet decision")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s.%(msecs)03d [server] %(message)s", datefmt="%H:%M:%S")
-    server = RendezvousServer(args.host, args.port)
+    server = RendezvousServer(args.host, args.port, args.subnet)
     if args.http_port:
         start_http(server, args.host, args.http_port)
     try:

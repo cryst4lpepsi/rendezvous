@@ -2,3 +2,9 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+build/
+dist/
+*.spec
+wintun.dll
+wintun*.zip
+ci-*.log

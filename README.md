@@ -1,225 +1,266 @@
-# Rendezvous: userspace NAT traversal with a live path view
+# Rendezvous: a peer-to-peer virtual LAN with a live path view
 
-Two peers connect over the internet through a NAT-traversing UDP tunnel. A
-rendezvous server introduces them. They try **UDP hole punching** to get a
-**direct** path, and fall back to **relaying through the server** if that fails.
-Each peer serves a live dashboard that shows the connection state machine as it
-runs, plus buttons that force path changes during a demo.
+Rendezvous puts up to 8 PCs on the same virtual LAN over the internet, like
+Radmin VPN or Hamachi. LAN games see each other as if the PCs were plugged
+into the same switch.
 
-Pure userspace Python. No virtual adapter, no drivers, no admin rights.
+- A small **rendezvous server** introduces the players and gives each one a
+  virtual IP (`10.77.0.x`).
+- Every pair of players tries **UDP hole punching** to get a **direct**
+  connection, and falls back to **relaying through the server** if that fails.
+  Each pair decides this on its own.
+- A **virtual network adapter** (Wintun on Windows) carries game traffic,
+  LAN broadcasts and multicast discovery through those connections.
+- The app window is a live dashboard. It shows each connection's state as it
+  changes, and has buttons that force path changes during a demo.
 
-![Dashboard during a Drop Direct Path demo: DIRECT → RECONNECTING, traffic already on the relay](docs/dashboard.png)
+![Dashboard with two players: carol direct, bob reconnecting after its direct path was dropped](docs/dashboard.png)
 
 ```
-rendezvous_server.py   UDP rendezvous + relay, HTTP status page (stdlib only)
-peer.py                the peer: state machine, tunnel, dashboard server
-dashboard.html         the live dashboard (plain HTML/CSS/JS, served by peer.py)
-udp_test.py            tiny UDP echo/send tool to test passthrough (no netcat on Windows)
-run_demo.bat           one-click, one-laptop demo on Windows
-tools/natlab.sh        Linux/WSL lab with two real NAT routers, used for testing
+app.py                 the desktop app (what Rendezvous.exe runs)
+peer.py                the engine: per-player state machines, tunnel, virtual LAN routing, dashboard server
+vnet.py                the virtual adapter: Wintun on Windows, /dev/net/tun on Linux
+dashboard.html         the dashboard (plain HTML/CSS/JS, served by the app)
+rendezvous_server.py   rendezvous + relay + virtual IP assignment (stdlib only)
+udp_test.py            tiny UDP echo/send tool for testing (Windows has no netcat)
+run_demo.bat           one-laptop demo: server + three peers, no adapter needed
+tools/                 test scripts: NAT lab, Wintun smoke test, CI end-to-end test
 ```
 
-## Install
+## Playing LAN games with friends
 
-Python 3.11 or newer.
+### 1. Run the server (once, on any machine with a public IP)
+
+A small cloud VM is enough. The server is a single file with no dependencies.
+
+```
+python3 rendezvous_server.py
+```
+
+Allow **UDP 9000** inbound in the VM's firewall / security group. TCP 9001 is
+an optional JSON status page. To keep it running after you log out, start it
+inside `tmux` or `screen`.
+
+### 2. Every player runs the app
+
+Download **Rendezvous.exe** from the latest successful
+[Windows app](../../actions/workflows/windows-app.yml) build (open the run, then
+the *Rendezvous-windows* artifact). Then:
+
+1. Double-click **Rendezvous.exe** and accept the administrator prompt.
+   Creating a network adapter needs admin rights, as with Radmin.
+2. In the **Join a network** window, enter:
+   - the server (`<server-ip>:9000`),
+   - a network name and an optional password, the same for everyone,
+   - your name.
+3. Your virtual IP appears at the top right, e.g. **10.77.0.2**. Each other
+   player shows up as a node and goes **PUNCHING → DIRECT** (or **RELAY**).
+
+The app remembers the network and rejoins it next time. Closing the window
+quits the app and removes the adapter.
+
+`Rendezvous-console.exe` is the same app with a console window showing the log,
+which helps with troubleshooting. Both write a log to `%APPDATA%\Rendezvous\`.
+
+### 3. Play
+
+- One player hosts a **LAN game**. The others find it in their game's LAN
+  list, because broadcasts and multicast are carried across. If a game doesn't
+  list it, connect directly to the host's `10.77.0.x` address.
+- Anything that runs over IPv4 works, both TCP and UDP. In testing, TCP
+  managed about 15 MB/s through the tunnel.
+
+**If something doesn't work:**
+- **"Rendezvous server not responding"**: wrong address, or UDP 9000 is not
+  open on the server.
+- **A player stays on RELAY**: their network blocks hole punching (symmetric
+  NAT, CGNAT on many mobile networks). It still works, just through the server.
+- **The game doesn't see the host**: check the host's virtual IP is pingable
+  (`ping 10.77.0.x`). The app adds a firewall rule allowing inbound traffic
+  from the virtual LAN. A game with its own firewall prompt still needs to be
+  allowed.
+- **The virtual LAN shows an error on the dashboard**: the app wasn't started as
+  administrator. The tunnel and chat still work.
+
+## Demo on one laptop (no admin, no adapter)
+
+Double-click `run_demo.bat`, or run each of these in its own terminal:
 
 ```
 py -m pip install -r requirements.txt
-```
-
-The rendezvous server uses only the standard library, so on a cloud box you can
-copy that one file and run it without installing anything.
-
-## Run it on one laptop (the guaranteed demo)
-
-Double-click `run_demo.bat`, or open three terminals:
-
-```
 py rendezvous_server.py
 py peer.py --name alice --http-port 8080
 py peer.py --name bob   --http-port 8081
+py peer.py --name carol --http-port 8082
 ```
 
-Open http://localhost:8080 and http://localhost:8081 side by side. Within a
-second both peers go **DISCOVERING → PUNCHING → DIRECT**.
-
-On loopback there's no NAT, so punching always succeeds. The demo controls
-(also on the keyboard) drive the other transitions:
+Open http://localhost:8080. Every pair goes **DISCOVERING → PUNCHING → DIRECT**
+within a second. On loopback there's no NAT, so punching always succeeds, and
+the controls drive the other transitions. The header buttons (and keys) act
+on every link; the buttons on a player's card act on that link only.
 
 | Button | Key | What happens |
 |---|---|---|
-| **Force Relay** | R | Both peers pin traffic to the relay. DIRECT → RELAY right away. |
-| **Force Re-punch** | P | Clears all overrides on both peers and punches again. → PUNCHING → DIRECT. |
-| **Drop Direct Path** | D | Silently discards every direct packet, as if the path died. The state is *not* changed by hand: the keepalive watchdog notices the silence after 3.5 s (watch the keepalive meter fill up), goes **RECONNECTING**, re-punch fails, and it falls back to **RELAY**. |
+| **Force Relay** | R | Both ends pin the link to the relay. DIRECT → RELAY right away. |
+| **Re-punch** | P | Clears overrides on both ends and punches again. → PUNCHING → DIRECT. |
+| **Drop Direct** | D | Silently discards every direct packet, as if the path died. The state is *not* changed by hand: the keepalive watchdog notices the silence after 3.5 s (watch the meter in the player's card), goes **RECONNECTING**, re-punch fails, and it falls back to **RELAY**. |
 
-A good demo order: let it reach DIRECT → send a chat message (tagged **DIRECT**)
-→ **R** → send another (tagged **RELAY**) → **P** → **D** and narrate the
-watchdog → **P** to recover.
+Chat goes to everyone. Each message is tagged with the path it took, and
+DIRECT and RELAY can differ per player.
 
-To start in the "punching fails" situation, run one peer with
-`--block-direct`. It punches for 5 s, falls back to RELAY, and retries direct
-every 30 s (`--relay-retry`).
+To start in the "punching fails" situation, run a peer with `--block-direct`.
+To run the virtual LAN from the command line, add `--vlan`. That needs an
+administrator terminal, and only works with one peer per PC, because two
+adapters with the same subnet on one machine conflict.
 
-## Run it across two machines
+## How it works
 
-1. Put `rendezvous_server.py` on a host with a public IP (any small cloud VM):
-   ```
-   python3 rendezvous_server.py            # UDP 9000, status page on TCP 9001
-   ```
-   Open **UDP 9000** inbound in the VM's firewall / security group (TCP 9001
-   only if you want the status page).
-2. On each machine, on **different networks** (e.g. home wifi and a phone hotspot):
-   ```
-   py peer.py --server <public-ip>:9000 --room <same-secret-code> --name alice
-   py peer.py --server <public-ip>:9000 --room <same-secret-code> --name bob
-   ```
-3. When Windows Firewall asks about Python, allow it. If you block it, inbound
-   punches get dropped and you will (correctly) end up on RELAY.
+### NAT hole punching
 
-What to expect: most home routers are "cone" NATs, so you get DIRECT. Many
-mobile carriers and corporate networks use symmetric NAT or CGNAT, so you get
-RELAY. Both are valid outcomes, and the dashboard shows which one you got and why.
+**The problem.** The players sit behind NAT routers. None of them knows the
+others' public address, and each router drops inbound packets it didn't ask
+for.
 
-`http://<public-ip>:9001/` shows the rooms, each peer's public endpoint, and how
-many packets the server relayed.
+**1. Registration (DISCOVERING).** Each peer sends `register` to the server
+from its one UDP socket. Its router creates a mapping
+`192.168.1.10:46705 ⇄ 203.0.113.1:46705`, and the server sees the packet
+arrive from the *public* side of that mapping. The server replies with "your
+public endpoint is X, your virtual IP is 10.77.0.2". It then introduces every
+peer in the network to every other: public endpoint, LAN endpoint and virtual
+IP. Peers re-register every 2 s, which keeps the mapping alive and lets the
+server notice departures.
 
-## Traffic through the tunnel
-
-**Chat (built in).** Type in the dashboard's chat box, or straight into the
-peer's terminal. Each message arrives on the other side tagged with the path it
-actually took (DIRECT or RELAY).
-
-**Passthrough (optional).** Carries a plain UDP app (a direct-IP game, a voice
-tool, etc.) through the tunnel:
-
-```
-# machine B, where the "server" app runs on UDP 5555
-py udp_test.py echo 5555
-py peer.py --name bob --app-target 127.0.0.1:5555
-
-# machine A: point the "client" app at 127.0.0.1:7000 instead of B's address
-py peer.py --name alice --app-listen 7000
-py udp_test.py send 127.0.0.1:7000
-```
-
-This is one flow, one direction of initiation, base64 inside JSON. It is fine
-for a demo, but not tuned for throughput, and large datagrams may get fragmented.
-
-## How NAT hole punching works here
-
-**The problem.** Both peers sit behind NAT routers. Neither knows the other's
-public address, and each router drops inbound packets it didn't ask for.
-
-**1. Registration (DISCOVERING).** Each peer sends `register` to the server from
-its single UDP socket. Its router creates a mapping
-`192.168.1.10:46705 ⇄ 203.0.113.1:46705` and the server sees the packet arrive
-from the *public* side of that mapping. The server replies with "this is your
-public endpoint" and, once both are in the room, hands each peer the other's
-public endpoint and LAN endpoint. Peers re-register every 2 s, which keeps the
-mapping alive and lets the server notice when a peer disappears.
-
-**2. Punching (PUNCHING).** Both peers send `punch` packets to each other's
-public endpoint every 250 ms, *from the same socket* they registered with, so
-they reuse the same mapping. A NAT lets a packet in only if it matches an
-earlier outbound packet. Alice's first punch is dropped by Bob's router, since
-Bob never talked to Alice. But sending it opened Alice's router towards Bob.
-When Bob's punch arrives it matches that opening and gets through. Bob's own
-punch did the same for his router, so Alice's next punch gets in too.
+**2. Punching (PUNCHING), for each pair.** Both peers send `punch` packets to
+each other's endpoints every 250 ms, *from the same socket* they registered
+with, so they reuse the same mapping. A NAT lets a packet in only if it matches
+an earlier outbound packet. Alice's first punch is dropped by Bob's router,
+because Bob never talked to Alice. But sending it opened Alice's router
+towards Bob. When Bob's punch arrives it matches that opening and gets through.
+Bob's punch did the same for his router, so Alice's next punch gets in too.
 Whoever receives a punch answers with `punch_ack` to the exact address it came
 from.
 
-**3. DIRECT.** The first packet that arrives straight from the peer (punch,
-ack, ping or pong) proves the path works. We lock onto the address it really
-came from (the "peer-reflexive" address), which may differ from what the server
-told us, e.g. when both peers are on the same LAN.
+**3. DIRECT.** The first packet that arrives straight from the peer proves the
+path works. We lock onto the address it really came from (the
+"peer-reflexive" address). Two players on the same home LAN end up talking
+over their `192.168.x` addresses.
 
-**4. RELAY.** If nothing gets through within 5 s, we wrap every message as
-`{"t":"relay", inner:...}` and send it to the server, which forwards it. That
-always works because both peers already have a live mapping to the server.
+**4. RELAY.** If nothing gets through within 5 s, traffic for that peer goes to
+the server, which forwards it. That always works because every peer has a live
+mapping to the server.
 
-**5. Keepalives, RECONNECTING.** On the direct path, each peer pings every
-second. The pongs give the RTT and also keep the NAT mappings from expiring.
-If no direct packet arrives for 3.5 s, the peer moves traffic to the relay
-straight away (no outage) and starts a new punch round (RECONNECTING). If that
-succeeds it goes back to DIRECT; otherwise RELAY. While on RELAY it retries
-direct every 30 s.
+**5. Keepalives, RECONNECTING.** On a direct path each side pings every second.
+The pongs give the RTT and keep the NAT mappings from expiring. After 3.5 s of
+silence the link moves to the relay straight away, so there's no outage, and
+starts a new punch round. That round ends back in DIRECT or in RELAY. While on
+RELAY, a link retries direct every 30 s.
 
 **Coordination.** Punching only works if both sides send at roughly the same
-time. So whenever a peer starts a punch round on its own (watchdog, periodic
-retry), it first sends a `punch_now` control message through the relay, and the
-other peer joins in. Forced relay and re-punch are sent the same way, so both
-dashboards always agree.
+time. Whenever one side starts a round on its own (watchdog, retry), it sends a
+`punch_now` control message through the relay so the other joins in. Forced
+relay and re-punch travel the same way, so both dashboards always agree.
 
-**When it fails.**
-- *Symmetric NAT*: the router picks a new public port for each destination, so
-  the port the server saw is useless to the peer. Predicting the port is out of
-  scope, so we fall back to RELAY.
-- *Port collisions on Linux-based routers*: if a punch reaches a router that
-  accepts unsolicited input, the router can record that flow. The peer's own
-  outbound punch then gets a different public port, so the punch misses. Most
-  home routers drop unsolicited WAN input, which avoids this.
-- *Firewalls* that block inbound UDP for the program.
+### The virtual LAN
 
-### The protocol
+The Wintun adapter is a network card with no cable. Windows sends packets for
+`10.77.0.0/24` into it, and we read them. Packets we write into it look to
+Windows like they arrived from the LAN.
 
-JSON over UDP, one message per datagram. Every peer-to-peer message carries
-`room` and `from`, and anything that doesn't match the room code and the known
-peer id is dropped.
+For each packet Windows sends into the adapter, the peer looks at the
+destination address:
 
-| message | path | meaning |
+| destination | goes to |
+|---|---|
+| another player's `10.77.0.x` | that player only |
+| `255.255.255.255`, `10.77.0.255`, `224.0.0.0/4` (multicast) | every player. This is how LAN game discovery reaches the others. |
+| anything else, or IPv6 | dropped |
+
+The receiving player checks that the packet's source is the sender's own
+virtual IP (anti-spoofing) and writes it into its adapter.
+
+Three settings make games behave:
+- The adapter gets interface **metric 1**, so Windows sends `255.255.255.255`
+  broadcasts and multicast discovery out through it. Radmin and Hamachi do the
+  same.
+- Its **MTU is 1280**, so packet + tunnel header fit in one UDP datagram
+  without fragmentation.
+- A **firewall rule** allows inbound traffic from `10.77.0.0/24`. Windows puts
+  new adapters in the "Public" profile, which would block hosting.
+
+### When punching fails
+
+- **Symmetric NAT**: the router picks a new public port for every destination,
+  so the port the server saw is useless to the other player. Port prediction
+  is out of scope, so the link uses RELAY.
+- **Port collision on Linux-based routers**: a router that accepts unsolicited
+  input can record an early punch as a connection. The local player's own
+  outbound punch then gets a different public port and misses. Most home
+  routers drop unsolicited WAN input, which avoids this. We hit this in the
+  NAT lab before making its routers realistic.
+- **Firewalls** that block inbound UDP for the program.
+
+### Wire format
+
+One UDP socket per player.
+
+| first byte | message | path |
 |---|---|---|
-| `register` / `registered` | peer ⇄ server | join room / "your public endpoint is X" |
-| `peer`, `peer_left` | server → peer | introduction / departure |
-| `relay` / `relayed` | peer → server → peer | wrapped message for the relay path |
-| `punch` / `punch_ack` | direct | open the NATs / confirm the path |
-| `ping` / `pong` | active path | keepalive + RTT; the pong goes back on the path the ping came in on |
-| `ctl` | relay (+ direct) | `punch_now`, `repunch`, `force_relay`; de-duplicated by id |
-| `chat`, `app` | active path | demo traffic / passthrough datagram |
+| `{` (JSON) | `register` / `registered` / `peer` / `peer_left` / `error` | player ⇄ server |
+| `{` | `relay` → `relayed` (wraps a control message for one peer) | player → server → player |
+| `{` | `punch` / `punch_ack`, `ping` / `pong`, `chat`, `ctl` (`punch_now`, `repunch`, `force_relay`) | direct or relayed |
+| `0x01` | `from_id(3) + IP packet`: virtual LAN packet | direct |
+| `0x02` / `0x03` | `to_id(3) + IP packet` / `from_id(3) + IP packet`: virtual LAN packet | via server |
 
-## Logs
-
-Both programs print timestamped logs. Add `--verbose` / `-v` to see every
-packet decision: punch sent, reply seen, keepalive, relay forwarding, packets
-dropped and why. The dashboard's event log shows the same state events (punch
-attempts can be hidden with the checkbox).
+Every JSON message between players carries the network code and the sender's
+id; anything that doesn't match is dropped. Binary packets are only accepted
+from an address punched with that player, or from the server. The server
+relays only for the address a peer registered from.
 
 ## Testing
 
-- **Loopback**: all transitions, chat on both paths, passthrough on both paths,
-  a peer quitting (the other goes back to DISCOVERING), `--block-direct`
-  startup, periodic relay retry.
-- **Real NAT** (`tools/natlab.sh`, Linux network namespaces, two MASQUERADE
-  routers that drop unsolicited inbound):
-  - both routers cone-like → DIRECT on the first punch, locked onto the peer's public endpoint;
-  - `natlab.sh up --symmetric` (one router with `--random-fully`) → punching
-    fails for real → RELAY;
-  - drop direct / re-punch through both NATs.
+- **Real NAT lab** (`tools/natlab.sh`, Linux network namespaces, MASQUERADE
+  routers that drop unsolicited inbound). alice and carol share one home router;
+  bob is behind another. Every peer runs with `--vlan`.
+  - All pairs reach DIRECT. alice↔carol goes over their shared LAN.
+  - `ping` across the virtual LAN works.
+  - Subnet broadcast and Minecraft-style multicast (`224.0.2.60:4445`) reach
+    both other players.
+  - TCP transfers about 15 MB/s.
+  - With `--symmetric`, bob's router uses random ports. His links genuinely
+    fail to punch and use RELAY, while alice↔carol stays DIRECT. Ping,
+    broadcast, multicast and TCP still work through the relay.
+- **`tools/ci_loopback_test.py`**: three peers on loopback reach a full DIRECT
+  mesh. Force Relay, chat over relay and Re-punch work. With `--exe` it also
+  checks that the built app joins and brings up its adapter.
+- **`tools/wintun_smoke.py`**: on the real adapter, checks outbound unicast,
+  subnet and `255.255.255.255` broadcast, multicast, inbound UDP and ping.
+- **GitHub Actions** (`.github/workflows/windows-app.yml`) runs both of those
+  on a real Windows machine, builds the `.exe` files, and tests the built exe.
 
-## Peer options
+## Peer options (`peer.py` / `Rendezvous.exe`)
 
 ```
---server HOST:PORT   rendezvous server (default 127.0.0.1:9000)
---room CODE          room code, both peers must match (default "demo")
---name NAME          display name
---http-port N        dashboard port (default 8080); --http-host 0.0.0.0 to show it on another device
---udp-port N         fix the tunnel's UDP port (default: any free port)
---punch-timeout S    punch this long before falling back (default 5)
---relay-retry S      retry direct every S seconds while on relay (default 30, 0 = never)
---block-direct       simulate an un-punchable NAT
---app-listen PORT / --app-target HOST:PORT   passthrough
---open               open the dashboard in a browser
---verbose            log every packet decision
+--server HOST:PORT     rendezvous server (default 127.0.0.1:9000)
+--room NAME            network name (default "demo"); --password to protect it
+--name NAME            display name (default: computer name)
+--vlan                 create the virtual adapter (always on in the app; --no-vlan to disable)
+--http-port N          dashboard port (default 8080)
+--punch-timeout S      punch this long before falling back (default 5)
+--relay-retry S        retry direct every S seconds while on relay (default 30, 0 = never)
+--block-direct         simulate an un-punchable NAT
+--open                 open the dashboard in a browser (peer.py)
+--no-window            app only: no window, keep running until Ctrl+C
+--verbose              log every packet decision
 ```
 
-## Deliberately out of scope
+## Limits
 
-- **No virtual network adapter (TUN/TAP), no LAN broadcast forwarding.** A
-  game's "Open to LAN" discovery uses broadcast/multicast on the local network
-  segment. Making that appear across the internet needs a virtual adapter, which
-  means a signed kernel driver on Windows. That is days of work and a demo risk.
-  The tunnel carries an explicit UDP stream instead, which is enough to prove
-  the overlay works.
-- **No encryption.** The room code is the only access check. Anyone who can see
-  the traffic can read it. A real version would add a key exchange (e.g. Noise).
-- **No symmetric-NAT port prediction**, no IPv6, no TURN-style allocation
-  auth, one peer pair per room, one passthrough flow.
+- **No encryption.** The network password only controls who can join. Anyone
+  who can see the traffic can read it. A real version would add a key exchange
+  (e.g. Noise/WireGuard).
+- IPv4 only. Up to 8 players per network. No port prediction for symmetric
+  NAT. The relay has no bandwidth limits.
+- Built and tested for Windows 10/11 x64. The engine also runs on Linux; there's
+  no macOS adapter.
+- Python is fast enough for games (tens of MB/s) but uses more CPU than a native
+  tool like WireGuard.
