@@ -92,8 +92,15 @@ def main():
     except OSError:
         pass
 
-    s.sendto(b"unicast-test", (REMOTE, 4000))
-    check("outbound unicast to 10.77.0.50", wait_for(is_udp_to(REMOTE, 4000, b"unicast-test")) is not None)
+    # Windows may still be finishing the interface setup: a game would simply
+    # resend, so allow a few tries and say which one got through.
+    for attempt in range(1, 4):
+        s.sendto(b"unicast-test", (REMOTE, 4000))
+        if wait_for(is_udp_to(REMOTE, 4000, b"unicast-test"), timeout=2.0) is not None:
+            check("outbound unicast to 10.77.0.50", True, f"(attempt {attempt})")
+            break
+    else:
+        check("outbound unicast to 10.77.0.50", False, "(3 attempts)")
 
     s.sendto(b"subnet-bcast", ("10.77.0.255", 4445))
     check("outbound subnet broadcast 10.77.0.255", wait_for(is_udp_to("10.77.0.255", 4445, b"subnet-bcast")) is not None)

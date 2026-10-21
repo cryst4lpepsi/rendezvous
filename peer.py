@@ -131,6 +131,7 @@ class Link:
         self.state = DISCOVERING
         self.state_since = now()
         self.direct_addr = None    # the address that actually answered a punch
+        self.direct_addr_seen = 0.0
         self.forced_relay = False  # operator pinned this link to RELAY
         self.blackhole = blackhole # simulate a dead direct path: drop all direct packets
 
@@ -485,7 +486,7 @@ class Peer:
             link.last_punch = 0.0
         link.relay_silent_warned = False
         if new == DIRECT:
-            link.last_direct_rx = now()
+            link.last_direct_rx = link.direct_addr_seen = now()
         self.event(level, f"{old} -> {new}: {reason}", link)
         self.broadcast({"type": "transition", "peer": link.id, "name": link.name, "from": old, "to": new})
         self.push_state()
@@ -515,9 +516,16 @@ class Peer:
             self.set_state(link, DIRECT, f"{why} from {fmt(addr)} - "
                                          f"{'direct path restored' if restored else 'hole punched, traffic now peer-to-peer'}",
                            "good")
-        elif link.state == DIRECT and addr != link.direct_addr:
-            self.event("info", f"direct address moved {fmt(link.direct_addr)} -> {fmt(addr)}", link)
-            link.direct_addr = addr
+        elif link.state == DIRECT:
+            # A peer on our LAN can answer from more than one address (its LAN
+            # IP and, via the router, its public one). Stick with the address
+            # we use and only move if it has gone quiet.
+            t = now()
+            if addr == link.direct_addr:
+                link.direct_addr_seen = t
+            elif t - link.direct_addr_seen > 2.0:
+                self.event("info", f"direct address moved {fmt(link.direct_addr)} -> {fmt(addr)}", link)
+                link.direct_addr, link.direct_addr_seen = addr, t
 
     async def _ticker(self):
         while True:

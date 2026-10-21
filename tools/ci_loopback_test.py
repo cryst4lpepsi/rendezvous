@@ -90,7 +90,8 @@ def main():
                    "host mode: joiner connects with the invite code, DIRECT both ways"))
     sys.path.insert(0, str(ROOT))
     import hosting
-    bad = hosting.make_invite(hosting.parse_invite(invite)["server"], "hostci", "wrong-password")
+    good = hosting.parse_invite(invite)
+    bad = hosting.make_invite(good["server"], "hostci", "wrong-password", good["alt"])
     start([PY, "peer.py", "--invite", bad, "--name", "intruder", "--http-port", "8382"], "ci-intruder.log")
     ok.append(wait(lambda: api(8382)["joined"] is False and len(api(8380)["peers"]) == 1, 15,
                    "host mode: wrong password is refused"))
