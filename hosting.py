@@ -13,11 +13,15 @@ If the router doesn't do UPnP, you can forward the port by hand, or everyone can
 use a rendezvous server on a cloud VM instead (rendezvous_server.py).
 """
 
+import base64
 import hashlib
+import hmac
 import ipaddress
 import json
 import logging
+import os
 import re
+import secrets
 import socket
 import struct
 import subprocess
@@ -64,8 +68,10 @@ def make_code(network, ip, port=DEFAULT_PORT):
 
 
 def format_code(code):
-    """1234567890 -> "123 456 7890" (easier to read out or type)."""
+    """1234567890 -> "123 456 7890", 123456 -> "123 456" (easier to read out or type)."""
     digits, _, port = code.partition(":")
+    if len(digits) == 6:
+        return f"{digits[:3]} {digits[3:]}"
     return f"{digits[:3]} {digits[3:6]} {digits[6:]}" + (f" :{port}" if port else "")
 
 
@@ -446,18 +452,6 @@ def open_router_ports(ports):
     raise PortMapError("; ".join(errors))
 
 
-def public_ip_from_web():
-    """Last resort when the router can't tell us: ask a 'what is my IP' service."""
-    for url in ("https://api.ipify.org", "https://ifconfig.me/ip"):
-        try:
-            ip = urllib.request.urlopen(url, timeout=5).read().decode().strip()
-            ipaddress.ip_address(ip)
-            return ip
-        except (OSError, ValueError):
-            continue
-    return None
-
-
 def allow_app_through_firewall():
     """
     Windows Firewall blocks programs from receiving connections until they are
@@ -472,6 +466,215 @@ def allow_app_through_firewall():
               "action=allow", f"program={sys.executable}", "protocol=UDP", "profile=any", "enable=yes"],
              check=False)
     return r.returncode == 0
+
+
+# ======================================== hosting behind CGNAT: STUN + mailbox
+# When no router port can be opened (the provider's CGNAT, or UPnP off), the
+# host can still be reached by hole punching. Two free public services are used
+# only to swap addresses, never for game traffic:
+#   STUN    - "which public address do my packets come from?"
+#   ntfy.sh - a public message board, used as a mailbox: the host posts its
+#             address there, a joining friend posts "I'm here, my address is
+#             ...", and both sides then punch through their NATs.
+# Messages are encrypted with a key made from the network name + code; the
+# mailbox name is a hash of them too, so the service sees only noise.
+MAILBOX_URL = os.environ.get("RENDEZVOUS_MAILBOX", "https://ntfy.sh").rstrip("/")
+STUN_SERVERS = os.environ.get("RENDEZVOUS_STUN", "stun.l.google.com:19302,stun.cloudflare.com:3478")
+SHORT_CODE_DIGITS = 6
+
+
+def stun_servers():
+    """The STUN servers as resolved (ip, port) addresses."""
+    out = []
+    for item in STUN_SERVERS.split(","):
+        host, _, port = item.strip().rpartition(":")
+        try:
+            out.append(socket.getaddrinfo(host, int(port), socket.AF_INET, socket.SOCK_DGRAM)[0][4][:2])
+        except (OSError, ValueError):
+            continue
+    return out
+
+
+def stun_probe():
+    """This PC's public address from a fresh socket (diagnostics / tests)."""
+    from rendezvous_server import parse_stun_response, stun_request
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(2)
+    try:
+        for addr in stun_servers():
+            tid = os.urandom(12)
+            try:
+                s.sendto(stun_request(tid), addr)
+                r = parse_stun_response(s.recvfrom(2048)[0])
+                if r and r[0] == tid:
+                    return r[1]
+            except OSError:
+                continue
+    finally:
+        s.close()
+    return None
+
+
+def new_short_code():
+    return f"{secrets.randbelow(10 ** SHORT_CODE_DIGITS):0{SHORT_CODE_DIGITS}d}"
+
+
+class Mailbox:
+    def __init__(self, room, code):
+        seed = f"rendezvous|{room}|{code}".encode()
+        self.topic = "rzv" + hashlib.sha256(b"topic|" + seed).hexdigest()[:32]
+        self._kenc = hashlib.sha256(b"enc|" + seed).digest()
+        self._kmac = hashlib.sha256(b"mac|" + seed).digest()
+        self.url = f"{MAILBOX_URL}/{self.topic}"
+
+    def _stream(self, nonce, n):
+        out, i = b"", 0
+        while len(out) < n:  # SHA-256 in counter mode as the keystream
+            out += hashlib.sha256(self._kenc + nonce + i.to_bytes(4, "big")).digest()
+            i += 1
+        return out[:n]
+
+    def seal(self, obj):
+        nonce = os.urandom(12)
+        pt = json.dumps(obj, separators=(",", ":")).encode()
+        ct = bytes(a ^ b for a, b in zip(pt, self._stream(nonce, len(pt))))
+        tag = hmac.new(self._kmac, nonce + ct, hashlib.sha256).digest()[:16]
+        return base64.urlsafe_b64encode(nonce + tag + ct).decode()
+
+    def unseal(self, text):
+        try:
+            raw = base64.urlsafe_b64decode(text)
+            nonce, tag, ct = raw[:12], raw[12:28], raw[28:]
+            if not hmac.compare_digest(tag, hmac.new(self._kmac, nonce + ct, hashlib.sha256).digest()[:16]):
+                return None
+            obj = json.loads(bytes(a ^ b for a, b in zip(ct, self._stream(nonce, len(ct)))))
+            return obj if isinstance(obj, dict) else None
+        except (ValueError, TypeError):
+            return None
+
+    def publish(self, obj):
+        req = urllib.request.Request(self.url, data=self.seal(obj).encode(), method="POST",
+                                     headers={"Content-Type": "text/plain", "User-Agent": "Rendezvous"})
+        urllib.request.urlopen(req, timeout=10).read()
+
+    def _messages(self, lines):
+        for line in lines:
+            try:
+                m = json.loads(line)
+            except ValueError:
+                continue
+            if m.get("event") == "message":
+                obj = self.unseal(m.get("message", ""))
+                if obj is not None:
+                    yield m.get("id"), obj
+
+    def fetch(self, since="12h"):
+        req = urllib.request.Request(f"{self.url}/json?poll=1&since={since}", headers={"User-Agent": "Rendezvous"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return [obj for _, obj in self._messages(r.read().decode(errors="replace").splitlines())]
+
+    def listen(self, on_message, stop):
+        """Call on_message(obj) for every new message, until `stop` is set."""
+        def run():
+            since = str(int(time.time()) - 5)
+            while not stop.is_set():
+                try:
+                    req = urllib.request.Request(f"{self.url}/json?since={since}", headers={"User-Agent": "Rendezvous"})
+                    with urllib.request.urlopen(req, timeout=90) as r:
+                        for mid, obj in self._messages(iter(r.readline, b"")):
+                            since = mid or since
+                            if stop.is_set():
+                                return
+                            on_message(obj)
+                except OSError as e:
+                    log.debug("mailbox stream: %s", e)
+                stop.wait(3)
+        threading.Thread(target=run, name="mailbox", daemon=True).start()
+
+
+class PunchHost:
+    """Keeps a CGNAT host reachable: announces its address in the mailbox and
+    punches toward every friend who knocks."""
+
+    def __init__(self, info, room, code):
+        self.info = info
+        self.server = info["server"].server
+        self.mailbox = Mailbox(room, code)
+        self.code = code
+        self.stop = threading.Event()
+        self.endpoint = None
+        self.symmetric = False
+        self.error = None
+        self.knocks = 0
+
+    def start(self):
+        """Blocking. Returns True when the host is announced."""
+        eps = [ep for ep in (self.server.stun(a) for a in stun_servers()[:2]) if ep]
+        if not eps:
+            self.error = "couldn't reach a STUN server to learn this PC's public address"
+            return False
+        self.endpoint = eps[0]
+        # The same public port towards two different servers = the NAT keeps
+        # one mapping per socket ("cone"): punching works. Different ports =
+        # "symmetric" NAT: punching will most likely fail.
+        self.symmetric = len(eps) > 1 and eps[0][1] != eps[1][1]
+        self.server.public_ip = self.endpoint[0]
+        try:
+            self.announce()
+        except OSError as e:
+            self.error = f"couldn't reach the mailbox service ({MAILBOX_URL}): {e}"
+            return False
+        self.mailbox.listen(self._on_message, self.stop)
+        threading.Thread(target=self._keepalive, name="punch-keepalive", daemon=True).start()
+        return True
+
+    def announce(self):
+        lan = self.info["lan_ip"]
+        self.mailbox.publish({"t": "host", "ep": list(self.endpoint),
+                              "lan": [lan, self.info["server"].port] if lan else None, "ts": int(time.time())})
+
+    def _on_message(self, obj):
+        ep = obj.get("ep")
+        if obj.get("t") == "knock" and isinstance(ep, list) and len(ep) == 2:
+            self.knocks += 1
+            log.info("knock from %s at %s:%s - punching toward it", obj.get("name"), ep[0], ep[1])
+            self.server.punch_toward((str(ep[0]), int(ep[1])))
+
+    def _keepalive(self):
+        """Keep the NAT mapping alive (they expire after ~30 s idle on many
+        NATs) and re-announce if the public address changes."""
+        last_announce = time.time()
+        while not self.stop.wait(20):
+            servers = stun_servers()
+            ep = self.server.stun(servers[0]) if servers else None
+            changed = bool(ep) and ep != self.endpoint
+            if changed:
+                log.info("public address changed %s -> %s, re-announcing", self.endpoint, ep)
+                self.endpoint = ep
+                self.server.public_ip = ep[0]
+            if changed or time.time() - last_announce > 600:  # ntfy keeps messages ~12 h
+                try:
+                    self.announce()
+                    last_announce = time.time()
+                except OSError as e:
+                    log.info("mailbox re-announce failed: %s", e)
+
+    def close(self):
+        self.stop.set()
+
+
+def parse_any(network, text):
+    """A code typed by a friend: 10 digits = the host's address (direct), 6
+    digits = a mailbox code (host behind CGNAT). Raises ValueError."""
+    if not room_for(network):
+        raise ValueError("enter the network name too")
+    digits = re.sub(r"[\s.\-]", "", text or "").partition(":")[0]
+    if digits.isdigit() and len(digits) == SHORT_CODE_DIGITS and ":" not in (text or ""):
+        return {"kind": "mailbox", "code": digits}
+    if digits.isdigit() and len(digits) == 10:
+        ip, port = parse_code(network, text)
+        return {"kind": "address", "ip": ip, "port": port}
+    raise ValueError(f"the code is {SHORT_CODE_DIGITS} or 10 digits, like 123 456 or 123 456 7890")
 
 
 # ============================================================ embedded server
@@ -507,7 +710,7 @@ def _renew_loop(info):
             mapper.refresh()
 
 
-def start_hosting(port, room, peer_udp_port, use_upnp=True):
+def start_hosting(port, room, peer_udp_port, use_upnp=True, punch_code=None):
     """
     Blocking (run it off the UI/event-loop thread). Starts the embedded server
     and tries to make it reachable from the internet. Returns a dict:
@@ -518,7 +721,8 @@ def start_hosting(port, room, peer_udp_port, use_upnp=True):
     info = {"server": server, "mapper": None, "public_ip": None, "server_port": server.port,
             "lan_ip": lan_ip_towards("8.8.8.8"), "gateway": default_gateway(),
             "reachable": None, "status": "", "stop": threading.Event(), "use_upnp": use_upnp,
-            "peer_udp_port": peer_udp_port}
+            "peer_udp_port": peer_udp_port, "room": room, "mode": None, "punch": None,
+            "punch_code": punch_code or new_short_code()}
     info["firewall"] = allow_app_through_firewall()
     map_ports(info)
     threading.Thread(target=_renew_loop, args=(info,), name="port-renewal", daemon=True).start()
@@ -543,27 +747,47 @@ def map_ports(info):
             error = None
         except PortMapError as e:
             error = str(e)
-    if not info["public_ip"]:
-        info["public_ip"] = public_ip_from_web()
     server.server.public_ip = info["public_ip"]
 
     gw = info["gateway"] or "your router"
     if info["mapper"] and info["public_ip"] and not is_private(info["public_ip"]):
-        info["reachable"] = True
+        info["reachable"], info["mode"] = True, "direct"
         info["status"] = (f"Router port opened automatically ({info['mapper'].name}): UDP {info['server_port']} "
                           f"is open, friends anywhere can join.")
-    elif info["mapper"] and info["public_ip"]:
-        info["reachable"] = False
-        info["status"] = (f"Your router's internet address ({info['public_ip']}) is not a public one: your "
-                          f"internet provider probably uses CGNAT, so nobody outside your home can reach you. "
-                          f"Let a friend with a normal connection host instead.")
+        if info["punch"]:  # no need for the mailbox any more
+            info["punch"].close()
+            info["punch"] = None
+        return info
+
+    info["reachable"] = False
+    if info["mapper"] and info["public_ip"]:
+        why = "your internet provider uses CGNAT"
+        info["detail"] = (f"the router's internet address {info['public_ip']} is not a public one (CGNAT); "
+                          f"nothing on the router can change that")
     else:
-        info["reachable"] = False
-        info["status"] = (f"Your router didn't open the port automatically ({error}). Friends on your home "
-                          f"network can join already. For friends over the internet, open your router's settings "
-                          f"(usually http://{gw}) and either turn on UPnP, then click Try again, or forward "
-                          f"UDP {server.port} to this PC ({info['lan_ip'] or 'this PC'}). "
-                          f"Or let a friend whose router has UPnP host.")
+        why = "your router's port isn't open"
+        info["detail"] = (f"router port not opened: {error}. To host without the online services: open "
+                          f"http://{gw}, turn on UPnP and click Try again, or forward UDP {server.port} to "
+                          f"{info['lan_ip'] or 'this PC'}")
+    # Fall back to hole punching, with STUN + the mailbox to swap addresses.
+    if not info["punch"] or info["punch"].error:
+        ph = PunchHost(info, info["room"], info["punch_code"])
+        ph.start()
+        info["punch"] = ph
+    ph = info["punch"]
+    if ph.error:
+        info["mode"] = "lan"
+        info["status"] = (f"Only friends on your home network can join: {why}, and the online fallback "
+                          f"failed ({ph.error}). Let a friend with a normal connection host.")
+    else:
+        info["mode"] = "punch"
+        if not info["public_ip"] or is_private(info["public_ip"]):
+            info["public_ip"] = ph.endpoint[0]
+        info["status"] = (f"Online through hole punching ({why}). Friends connect straight to you; the free "
+                          f"services STUN and ntfy.sh only help swap addresses."
+                          + (" Warning: your connection changes ports for every destination (symmetric NAT), "
+                             "so punching will probably fail; if friends can't connect, let someone else host."
+                             if ph.symmetric else ""))
     return info
 
 
@@ -571,6 +795,8 @@ def stop_hosting(info):
     if not info:
         return
     info["stop"].set()
+    if info.get("punch"):
+        info["punch"].close()
     if info.get("mapper"):
         info["mapper"].remove_all()
     info["server"].stop()

@@ -61,6 +61,33 @@ MAX_DATAGRAM = 65535
 BIN_RELAY = 0x02        # peer -> server
 BIN_RELAYED = 0x03      # server -> peer
 
+# STUN (RFC 5389) binding requests: "what address do my packets come from?"
+# Used when a player hosts from behind CGNAT (see hosting.py).
+STUN_MAGIC = b"\x21\x12\xa4\x42"
+
+
+def stun_request(tid):
+    return b"\x00\x01\x00\x00" + STUN_MAGIC + tid
+
+
+def parse_stun_response(data):
+    """Returns (transaction_id, (ip, port)) for a STUN success response, else None."""
+    if len(data) < 20 or data[0:2] != b"\x01\x01" or data[4:8] != STUN_MAGIC:
+        return None
+    tid, pos, end = data[8:20], 20, 20 + int.from_bytes(data[2:4], "big")
+    mapped = None
+    while pos + 4 <= min(end, len(data)):
+        atype, alen = int.from_bytes(data[pos:pos + 2], "big"), int.from_bytes(data[pos + 2:pos + 4], "big")
+        val = data[pos + 4:pos + 4 + alen]
+        if atype in (0x0020, 0x8020) and len(val) >= 8 and val[1] == 1:  # XOR-MAPPED-ADDRESS, IPv4
+            port = int.from_bytes(val[2:4], "big") ^ 0x2112
+            ip = bytes(a ^ b for a, b in zip(val[4:8], STUN_MAGIC))
+            return tid, (socket.inet_ntoa(ip), port)
+        if atype == 0x0001 and len(val) >= 8 and val[1] == 1:  # MAPPED-ADDRESS (old servers)
+            mapped = (socket.inet_ntoa(val[4:8]), int.from_bytes(val[2:4], "big"))
+        pos += 4 + alen + (-alen % 4)
+    return (tid, mapped) if mapped else None
+
 
 def disable_udp_connreset(sock):
     """
@@ -153,6 +180,7 @@ class RendezvousServer:
         self.only_room = None   # serve just this network
         self.public_ip = None   # the host's public IP, to describe peers that sit on the host's LAN
         self.overrides = {}     # port of a peer on this machine -> its port-forwarded (ip, port)
+        self._stun_waiting = {}  # transaction id -> [threading.Event, result]
 
     # ------------------------------------------------------------------ io
     def send(self, msg, addr):
@@ -181,6 +209,13 @@ class RendezvousServer:
                 if not self.running:
                     break
                 raise
+            stun = parse_stun_response(data) if data[:1] == b"\x01" else None
+            if stun:
+                waiter = self._stun_waiting.get(stun[0])
+                if waiter:
+                    waiter[1] = stun[1]
+                    waiter[0].set()
+                continue
             with self.lock:
                 if data and data[0] == BIN_RELAY:
                     self.on_binary_relay(data, addr)
@@ -194,6 +229,35 @@ class RendezvousServer:
                         continue
                     self.handle(msg, addr, len(data))
                 self.expire()
+
+    def stun(self, server_addr, timeout=2.0):
+        """Ask a STUN server, from this server's own socket, which public
+        address our packets come from. Called from another thread."""
+        import os
+        tid = os.urandom(12)
+        waiter = self._stun_waiting[tid] = [threading.Event(), None]
+        try:
+            for wait in (timeout / 3, timeout * 2 / 3):  # one resend
+                self.sock.sendto(stun_request(tid), server_addr)
+                if waiter[0].wait(wait):
+                    return waiter[1]
+        except OSError as e:
+            log.debug("STUN to %s failed: %s", server_addr, e)
+        finally:
+            self._stun_waiting.pop(tid, None)
+        return None
+
+    def punch_toward(self, addr, count=20, every=0.3):
+        """Hole punching for a host behind CGNAT: a player who wants in told us
+        its public address (through the mailbox); sending to it opens our NAT
+        for that player's packets, while its own packets open its side."""
+        def run():
+            for _ in range(count):
+                if not self.running:
+                    return
+                self.send({"t": "hi"}, addr)
+                time.sleep(every)
+        threading.Thread(target=run, name="punch-toward", daemon=True).start()
 
     # ------------------------------------------------------------ handlers
     def handle(self, msg, addr, size):

@@ -6,9 +6,11 @@ into the same switch.
 
 - One player clicks **Host a network** and picks a network name. Their app
   runs the **rendezvous server**, opens the router port with UPnP, and shows a
-  **10-digit code**. Everyone else clicks **Join a network** and types the
-  network name and the code. No cloud server, account or lookup service is
-  needed. A cloud server still works for networks that can't host.
+  short code. Everyone else clicks **Join a network** and types the network
+  name and the code. No cloud server or account is needed. When the router
+  port can be opened, the 10-digit code needs nothing else at all. Behind a
+  provider's CGNAT, a 6-digit code works through hole punching, with two free
+  public services used only to swap addresses.
 - The server introduces the players and gives each one a virtual IP
   (`10.77.0.x`).
 - Every pair of players tries **UDP hole punching** to get a **direct**
@@ -31,7 +33,7 @@ dashboard.html         the web dashboard used by the command-line demo (peer.py)
 rendezvous_server.py   rendezvous + relay + virtual IP assignment (stdlib only)
 udp_test.py            tiny UDP echo/send tool for testing (Windows has no netcat)
 run_demo.bat           one-laptop demo: server + three peers, no adapter needed
-tools/                 test scripts: NAT lab, Wintun smoke test, CI end-to-end test
+tools/                 test scripts: NAT/CGNAT/UPnP labs, stand-in STUN + mailbox, Wintun smoke test, CI end-to-end test
 ```
 
 ## Playing LAN games with friends
@@ -51,10 +53,19 @@ as with Radmin. Windows SmartScreen may warn because the exe isn't signed; use
    port: UPnP first, then NAT-PMP (which many routers speak when UPnP is off).
    It also allows itself through Windows Firewall, and renews the router lease
    every 20 minutes so long sessions don't drop. The **Invite friends** window
-   then shows:
-   - the **network name** and a **10-digit code** like `423 122 2530`, with
-     a **Copy** button;
-   - whether the port was opened (✓), or what to do if it wasn't (⚠).
+   then shows the **network name**, the **code** and a **Copy** button. What
+   kind of code you get depends on your connection:
+   - **Port opened** (✓ green): a **10-digit code** like `423 122 2530`. It is
+     your address in disguise, and no outside service is involved.
+   - **Port can't be opened** (✓ blue), because your provider uses **CGNAT**
+     (an address like `100.x.x.x`) or the router has no UPnP: a **6-digit
+     code** like `661 958`. Friends then connect by **hole punching** through
+     your NAT. Two free public services are used only to swap addresses before
+     the punch: a STUN server tells each PC its public address, and ntfy.sh
+     carries a short encrypted note between the PCs. Game traffic never goes
+     through them.
+   - **Neither works** (⚠): only friends on your home network can join, and
+     the message says why.
 3. Tell your friends the name and the code. Keep Rendezvous open while you
    play: the network runs on your PC. **Stop hosting** closes it and removes
    the port forwarding.
@@ -70,6 +81,19 @@ A mistyped name or code can't find the host; the app gives up after a few
 seconds and says so. The app remembers your network and reconnects next time
 (a host hosts again). **Invite friends…** shows the name and code to anyone in
 the network. Closing the window leaves the network and removes the adapter.
+
+#### How the codes work
+
+**6-digit codes (host behind CGNAT).** The host's app learns its public address
+from a STUN server and posts it to a mailbox on ntfy.sh. The mailbox's name is
+a hash of the network name and code, and its contents are encrypted with a key
+made from them, so the service only ever sees noise. A joining friend's app
+reads the host's address, posts "I'm here, my address is …" to the same
+mailbox, and starts sending to the host. The host's server sends toward the
+friend at the same time. Each side's outgoing packets open its own NAT, so
+both get through: the same hole punching the players use with each other. If
+the host's public address changes, the app posts the new one, and the code
+stays the same. The host keeps the same code the next time it hosts that network.
 
 #### How a 10-digit code can be enough
 
@@ -116,9 +140,13 @@ player only, or on everyone when no player is selected.
   Without an open port (or a server on the internet) friends can't make the
   first contact: that is how home routers work, and it's the same for every
   tool like this.
-- **⚠ "not public … CGNAT"**: your internet provider shares one public address
-  between many customers, so nobody outside can reach you. Let a friend with a
-  normal connection host, or use a cloud server (below).
+- **CGNAT** (your router reports an address like `100.78.64.213`): your
+  provider shares one public address between many customers, and no router
+  setting can open a port. The app switches to hole punching with a 6-digit
+  code (see above), which works with most connections. If a friend gets
+  *"couldn't punch through to the host … symmetric NAT"*, one of the two
+  connections changes ports for every destination, which hole punching can't
+  get through. Let someone else host, or use a cloud server (below).
 - **"Couldn't reach the host"** when joining: check the network name and code,
   that the host has Rendezvous open, and that their port is open (see above).
 - **A player stays on RELAY**: their network blocks hole punching (symmetric
@@ -303,6 +331,16 @@ relays only for the address a peer registered from.
   - With `--symmetric`, bob's router uses random ports. His links genuinely
     fail to punch and use RELAY, while alice↔carol stays DIRECT. Ping,
     broadcast, multicast and TCP still work through the relay.
+- **Hosting behind CGNAT** (`natlab.sh up --cgnat`: alice's home router sits
+  behind a second, provider NAT and has no UPnP; `tools/fake_services.py`
+  stands in for STUN and ntfy.sh):
+  - alice gets a 6-digit code;
+  - bob, on another network, joins with name + code, knocks through the
+    mailbox, alice's server punches back, and the whole mesh goes DIRECT;
+  - carol, in alice's house, is found by the local broadcast;
+  - with bob behind a symmetric NAT, punching fails and he gets a clear message
+    after 25 s instead of hanging.
+  - CI also checks the real STUN servers and ntfy.sh from Windows.
 - **Hosting through a real UPnP router** (`tools/upnplab.sh`: the same lab with
   `miniupnpd` on alice's router, no cloud server):
   - alice hosts. The app finds the router, reads its public IP, and forwards
@@ -329,7 +367,7 @@ relays only for the address a peer registered from.
 --room NAME            network name (default "demo"); --password to protect it
 --name NAME            display name (default: computer name)
 --host                 host the network (built-in server + UPnP); --host-port, --no-upnp
---code 1234567890      join a hosted network with its code (network name in --room)
+--code CODE            join a hosted network with its 6- or 10-digit code (network name in --room)
 --vlan                 create the virtual adapter (always on in the app; --no-vlan to disable)
 --http-port N          dashboard port (default 8080)
 --punch-timeout S      punch this long before falling back (default 5)

@@ -36,6 +36,7 @@ import collections
 import ipaddress
 import json
 import logging
+import os
 import re
 import secrets
 import socket
@@ -44,7 +45,7 @@ import threading
 import time
 from pathlib import Path
 
-from rendezvous_server import disable_udp_connreset
+from rendezvous_server import STUN_MAGIC, disable_udp_connreset, parse_stun_response, stun_request
 
 log = logging.getLogger("peer")
 
@@ -200,8 +201,12 @@ class Peer:
         self.server_candidates = []  # [address as typed, fallback (host's LAN address)]
         self.server_index = 0
         self.hosting = None      # set while we host the network (see hosting.py)
-        self.code = None         # 10-digit join code of the current network, if it has one
+        self.code = None         # join code of the current network (10 or 6 digits), if it has one
         self.hosting_busy = False
+        self._stun_waiters = {}  # STUN transaction id -> future
+        self.last_host_stun = 0.0
+        self.join_patience = 6.0  # seconds a code join waits for the host before giving up
+        self.server_ever_ok = False
         self.room = None         # what the server matches on: "network/password"
         self.my_id = None
         self.my_raw_id = None
@@ -336,6 +341,8 @@ class Peer:
             self.event("bad", f"cannot resolve server '{server}': {e}")
             return False
         self.server_candidates = [server] + ([alt] if alt and alt != server else [])
+        self.join_patience = 6.0
+        self.server_ever_ok = False
         if not room:
             self.code = None  # joined by server address: no join code
         self.server_index = 0
@@ -399,7 +406,10 @@ class Peer:
         info, err = None, None
         for p in range(port, port + 10):  # next free port if this one is taken
             try:
-                info = await self.loop.run_in_executor(None, hosting.start_hosting, p, room, self.udp_port, use_upnp)
+                # Same network as last time: keep the 6-digit code friends already have.
+                keep = self.config.get("punch_code") if hosting.room_for(self.config.get("network")) == room else None
+                info = await self.loop.run_in_executor(None, hosting.start_hosting, p, room, self.udp_port,
+                                                       use_upnp, keep)
                 break
             except OSError as e:
                 err = e
@@ -410,21 +420,53 @@ class Peer:
             return
         self.hosting = info
         self.code = self._host_code(network, info)
-        self.event("good" if info["reachable"] else "warn", info["status"])
+        if info["mode"] == "punch":
+            await self._refresh_host_stun()
+        self.event("good" if info["mode"] in ("direct", "punch") else "warn", info["status"])
+        if info.get("detail") and info["mode"] != "direct":
+            self.event("info", f"details: {info['detail']}")
         if remember:
-            self._save_config(mode="host", network=network, name=(name or self.name),
-                              host_port=port, upnp=use_upnp, autojoin=True)
+            self._save_config(mode="host", network=network, name=(name or self.name), host_port=port,
+                              upnp=use_upnp, autojoin=True, punch_code=info["punch_code"])
         self.join(f"127.0.0.1:{info['server'].port}", network, "", name, remember=False, room=room)
         self.event("good", f"hosting - friends join with network name '{network}' and code "
                            f"{hosting.format_code(self.code)}")
 
     @staticmethod
     def _host_code(network, info):
-        # The join code is our public address; without one (router port not
-        # opened, no internet lookup) it's the LAN address, which still works at home.
+        # Port open: the code IS our public address (10 digits, nothing else
+        # needed). Behind CGNAT / closed port: a 6-digit mailbox code. Neither:
+        # the LAN address, which still works for friends at home.
         import hosting
+        if info["mode"] == "punch":
+            return info["punch_code"]
         return hosting.make_code(network, info["public_ip"] or info["lan_ip"] or "127.0.0.1",
-                                 info["server_port"] if info["public_ip"] else info["server"].port)
+                                 info["server_port"] if info["mode"] == "direct" else info["server"].port)
+
+    async def stun_self(self):
+        """Our tunnel socket's public address, asked from a STUN server."""
+        import hosting
+        for addr in await self.loop.run_in_executor(None, hosting.stun_servers):
+            tid = secrets.token_bytes(12)
+            fut = self._stun_waiters[tid] = self.loop.create_future()
+            try:
+                for wait in (0.7, 1.4):
+                    self.transport.sendto(stun_request(tid), addr)
+                    try:
+                        return await asyncio.wait_for(asyncio.shield(fut), wait)
+                    except asyncio.TimeoutError:
+                        continue
+            finally:
+                self._stun_waiters.pop(tid, None)
+        return None
+
+    async def _refresh_host_stun(self):
+        """Host behind CGNAT: tell our own server where players can reach our
+        tunnel socket, and keep that NAT mapping alive."""
+        self.last_host_stun = now()
+        ep = await self.stun_self()
+        if ep and self.hosting:
+            self.hosting["server"].server.overrides[self.udp_port] = ep
 
     def retry_ports(self):
         """The "Try again" button: ask the router to open the port again (after
@@ -446,31 +488,94 @@ class Peer:
         if self.hosting is not info:
             return
         old, self.code = self.code, self._host_code(self.network, info)
-        self.event("good" if info["reachable"] else "warn", info["status"])
+        if info["mode"] == "punch":
+            await self._refresh_host_stun()
+        self.event("good" if info["mode"] in ("direct", "punch") else "warn", info["status"])
         if self.code != old:
             self.event("warn", f"the join code changed: it is now {hosting.format_code(self.code)}")
         self.push_state()
 
     def join_code(self, network, code, name=None, remember=True):
-        """Join a friend's network with its name and 10-digit code."""
+        """Join a friend's network with its name and code (6 or 10 digits)."""
         import hosting
         network = " ".join((network or "").split())
         try:
-            ip, port = hosting.parse_code(network, code)
+            parsed = hosting.parse_any(network, code)
         except ValueError as e:
             self.event("bad", f"join code: {e}")
             self.broadcast({"type": "join_failed", "reason": str(e)})
             return False
-        asyncio.ensure_future(self._join_code(network, code, ip, port, name, remember))
+        if parsed["kind"] == "mailbox":
+            asyncio.ensure_future(self._join_mailbox(network, parsed["code"], name, remember))
+        else:
+            asyncio.ensure_future(self._join_code(network, code, parsed["ip"], parsed["port"], name, remember))
         return True
+
+    async def _find_on_lan(self, network, port):
+        import hosting
+        if os.environ.get("RENDEZVOUS_NO_LAN_DISCOVERY"):  # tests: force the internet path
+            return None
+        self.event("info", f"looking for '{network}' on this network first...")
+        found = await self.loop.run_in_executor(None, hosting.find_on_lan, network, port)
+        if found:
+            self.event("good", f"found the host on this network at {found}")
+        return found
+
+    async def _join_mailbox(self, network, code, name, remember):
+        """6-digit code: the host is behind CGNAT. Look up its address in the
+        mailbox, tell it ours ("knock"), and punch through both NATs."""
+        import hosting
+        room = hosting.room_for(network)
+        if remember:
+            self._save_config(mode="code", network=network, code=code, name=(name or self.name), autojoin=True)
+        found = await self._find_on_lan(network, hosting.DEFAULT_PORT)
+        if found:
+            self.join(found, network, "", name, remember=False, room=room)
+            self.code = code
+            return
+
+        def fail(reason):
+            self.event("bad", reason)
+            self._save_config(autojoin=False)
+            self.broadcast({"type": "join_failed", "reason": reason})
+
+        mailbox = hosting.Mailbox(room, code)
+        self.event("info", "looking up the host online (ntfy.sh mailbox)...")
+        try:
+            hosts = [m for m in await self.loop.run_in_executor(None, mailbox.fetch)
+                     if m.get("t") == "host" and isinstance(m.get("ep"), list) and len(m["ep"]) == 2]
+        except OSError as e:
+            return fail(f"couldn't reach the online lookup ({hosting.MAILBOX_URL}): {e}")
+        if not hosts:
+            return fail("no host is online with that network name and code - check both, and that the "
+                        "host has Rendezvous open")
+        ep = hosts[-1]["ep"]  # the newest announcement
+        mine = await self.stun_self()
+        if not mine:
+            return fail("couldn't reach a STUN server to learn this PC's public address")
+        self.event("info", f"host is at {ep[0]}:{ep[1]}; we are {mine[0]}:{mine[1]} - knocking and punching")
+        self.join(f"{ep[0]}:{ep[1]}", network, "", name, remember=False, room=room)
+        self.code = code
+        self.join_patience = 25.0  # punching through two NATs takes a few rounds
+        asyncio.ensure_future(self._knock(mailbox, mine))
+
+    async def _knock(self, mailbox, mine):
+        """Tell the host (through the mailbox) where to punch towards, a few
+        times until its server answers."""
+        for wait in (0, 3, 3, 4, 5):
+            await asyncio.sleep(wait)
+            if not self.joined or self.server_ok:
+                return
+            try:
+                await self.loop.run_in_executor(None, mailbox.publish,
+                                                {"t": "knock", "ep": list(mine), "name": self.name})
+            except OSError as e:
+                log.info("knock failed: %s", e)
 
     async def _join_code(self, network, code, ip, port, name, remember):
         import hosting
-        self.event("info", f"looking for '{network}' on this network first...")
-        found = await self.loop.run_in_executor(None, hosting.find_on_lan, network, port)
+        found = await self._find_on_lan(network, port)
         public = f"{ip}:{port}"
-        if found:
-            self.event("good", f"found the host on this network at {found}")
         self.code = re.sub(r"[\s.\-]", "", code)
         if remember:
             self._save_config(mode="code", network=network, code=self.code, name=(name or self.name), autojoin=True)
@@ -524,7 +629,9 @@ class Peer:
             "dead_after": DIRECT_DEAD_AFTER,
             "hosting": None if not self.hosting else {
                 "status": self.hosting["status"], "reachable": self.hosting["reachable"],
-                "public_ip": self.hosting["public_ip"], "port": self.hosting["server_port"]},
+                "public_ip": self.hosting["public_ip"], "port": self.hosting["server_port"],
+                "mode": self.hosting["mode"],
+                "knocks": self.hosting["punch"].knocks if self.hosting.get("punch") else 0},
             "hosting_busy": self.hosting_busy,
             "code": self.code,
             "code_display": self._code_display(),
@@ -595,6 +702,8 @@ class Peer:
 
     def _tick(self):
         t = now()
+        if self.hosting and self.hosting["mode"] == "punch" and t - self.last_host_stun > 20:
+            asyncio.ensure_future(self._refresh_host_stun())
         if self.joined:
             if t - self.last_register >= REGISTER_INTERVAL:
                 self._register()
@@ -607,6 +716,8 @@ class Peer:
     def _tick_server(self, t):
         server_ok = bool(self.last_server_rx) and (t - self.last_server_rx) < SERVER_DEAD_AFTER \
             and self.last_server_rx >= self.joined_at
+        if server_ok:
+            self.server_ever_ok = True
         if server_ok and self.server_ok is not True:
             if self.server_ok is False:
                 self.event("good", "rendezvous server reachable again")
@@ -625,12 +736,16 @@ class Peer:
             self.local_addr = (guess_lan_ip(self.server_addr), self.udp_port)
             self.event("warn", f"no answer from the public address, trying the host's LAN address {addr}")
             self._register()
-        elif (not server_ok and self.server_ok is None and self.code and not self.hosting
-              and self.server_index + 1 >= len(self.server_candidates) and t - self.joined_at > 6):
-            # Joined with a code and nobody ever answered. A mistyped network
-            # name or code decodes to some random address: stop sending there.
-            reason = ("couldn't reach the host - check the network name and code, "
-                      "and that the host has Rendezvous open")
+        elif (not self.server_ever_ok and self.code and not self.hosting
+              and self.server_index + 1 >= len(self.server_candidates) and t - self.joined_at > self.join_patience):
+            # Joined with a code and the host never answered: stop sending.
+            # (A mistyped 10-digit code decodes to some random address.)
+            if self.join_patience > 6:
+                reason = ("couldn't punch through to the host: one of your two connections blocks hole "
+                          "punching (symmetric NAT). Let someone else host, or use a rendezvous server")
+            else:
+                reason = ("couldn't reach the host - check the network name and code, "
+                          "and that the host has Rendezvous open")
             self.event("bad", reason)
             self.leave(quiet=True)
             self._save_config(autojoin=False)
@@ -839,6 +954,12 @@ class Peer:
 
     # ============================================================== receiving
     def _on_datagram(self, data, addr):
+        if data[:1] == b"\x01" and data[4:8] == STUN_MAGIC:  # answer to stun_self()
+            r = parse_stun_response(data)
+            fut = self._stun_waiters.get(r[0]) if r else None
+            if fut and not fut.done():
+                fut.set_result(r[1])
+            return
         if not data or not self.joined:
             return
         kind = data[0]

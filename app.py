@@ -32,7 +32,7 @@ from PySide6.QtGui import (QAction, QBrush, QColor, QFont, QFontMetrics, QIcon, 
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QFrame,
                                QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
-                               QProgressBar, QPushButton, QSplitter, QStackedWidget, QTextEdit, QTreeWidget,
+                               QProgressBar, QPushButton, QSizePolicy, QSplitter, QStackedWidget, QTextEdit, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
 import hosting
@@ -427,7 +427,7 @@ class Topology(QWidget):
 
 # ================================================================ join dialog
 class StartDialog(QDialog):
-    """Host a network, or join one with its name and 10-digit code."""
+    """Host a network, or join one with its name and code."""
 
     def __init__(self, parent, saved, my_name, page="choose"):
         super().__init__(parent)
@@ -448,7 +448,7 @@ class StartDialog(QDialog):
         t = QLabel("Play LAN games over the internet")
         t.setObjectName("dialogTitle")
         v.addWidget(t)
-        sub = QLabel("One player hosts a network and gets a 10-digit code. "
+        sub = QLabel("One player hosts a network and gets a short code. "
                      "Everyone else joins with the network name and that code.")
         sub.setObjectName("muted")
         sub.setWordWrap(True)
@@ -481,7 +481,7 @@ class StartDialog(QDialog):
         self.h_upnp = QCheckBox("Open the port on my router automatically (UPnP)")
         self.h_upnp.setChecked(True)
         v.addWidget(self.h_upnp)
-        note = QLabel("You'll get a 10-digit code to give your friends. Keep Rendezvous open while you "
+        note = QLabel("You'll get a code to give your friends. Keep Rendezvous open while you "
                       "play: the network runs on this PC.")
         note.setObjectName("muted")
         note.setWordWrap(True)
@@ -501,7 +501,7 @@ class StartDialog(QDialog):
         self.j_net = QLineEdit(saved.get("network") if saved.get("mode") == "code" else "")
         self.j_net.setPlaceholderText("the host's network name")
         self.j_code = QLineEdit()
-        self.j_code.setPlaceholderText("123 456 7890")
+        self.j_code.setPlaceholderText("123 456  or  123 456 7890")
         self.j_code.setObjectName("code")
         self.j_name = QLineEdit(name)
         self.j_name.setMaxLength(32)
@@ -574,7 +574,7 @@ class StartDialog(QDialog):
                                "network": net, "password": self.j_pass.text(), "name": name}
         else:
             try:
-                hosting.parse_code(net, self.j_code.text())
+                hosting.parse_any(net, self.j_code.text())
             except ValueError as e:
                 return self.err.setText(f"Check the code: {e}.")
             self.result_cmd = {"cmd": "join_code", "network": net, "code": self.j_code.text(), "name": name}
@@ -582,7 +582,7 @@ class StartDialog(QDialog):
 
 
 class ShareDialog(QDialog):
-    """What the host tells friends: the network name and the 10-digit code."""
+    """What the host tells friends: the network name and the code."""
 
     def __init__(self, parent, network, code, hosting_info, on_retry=None):
         super().__init__(parent)
@@ -610,9 +610,12 @@ class ShareDialog(QDialog):
         grid.addRow("Code", codel)
         v.addLayout(grid)
         if hosting_info:
-            col = GREEN if hosting_info["reachable"] else AMBER
-            st = QLabel(("✓ " if hosting_info["reachable"] else "⚠ ") + esc(hosting_info["status"]))
+            mode = hosting_info.get("mode")
+            col = {"direct": GREEN, "punch": CYAN}.get(mode, AMBER)
+            st = QLabel(("\u2713 " if mode in ("direct", "punch") else "\u26a0 ") + esc(hosting_info["status"]))
             st.setWordWrap(True)
+            st.setMinimumWidth(470)
+            st.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
             st.setStyleSheet(f"border-left: 3px solid {col}; background: {rgba(col, 0.1)}; "
                              f"padding: 8px 10px; border-radius: 6px;")
             v.addWidget(st)
@@ -621,7 +624,7 @@ class ShareDialog(QDialog):
         warn.setWordWrap(True)
         v.addWidget(warn)
         row = QHBoxLayout()
-        if hosting_info and not hosting_info["reachable"] and on_retry:
+        if hosting_info and hosting_info.get("mode") != "direct" and on_retry:
             retry = QPushButton("Try again")
             retry.setObjectName("small")
             retry.setToolTip("Ask the router to open the port again, e.g. after turning on UPnP")
@@ -926,8 +929,11 @@ class MainWindow(QMainWindow):
         if s["hosting_busy"]:
             role = f"<b style='color:{CYAN}'>Setting up hosting\u2026</b> asking the router to open the port"
         elif h:
-            role = (f"<b style='color:{GREEN}'>HOSTING</b> \u00b7 reachable from the internet" if h["reachable"] else
-                    f"<b style='color:{AMBER}'>HOSTING</b> \u00b7 router port not open (see Invite friends)")
+            role = {"direct": f"<b style='color:{GREEN}'>HOSTING</b> \u00b7 reachable from the internet",
+                    "punch": f"<b style='color:{CYAN}'>HOSTING</b> \u00b7 online through hole punching"
+                             + (f" \u00b7 {h['knocks']} knock(s)" if h.get("knocks") else ""),
+                    }.get(h.get("mode"), f"<b style='color:{AMBER}'>HOSTING</b> \u00b7 home network only "
+                                         f"(see Invite friends)")
         elif s["joined"]:
             role = f"<b style='color:{TEXT}'>JOINED</b>"
         else:

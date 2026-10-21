@@ -98,6 +98,20 @@ def main():
     ok.append(wait(lambda: api(8382)["joined"] is False and len(api(8380)["peers"]) == 1, 20,
                    "host mode: wrong network name doesn't get in, and gives up"))
 
+    # The public services a host behind CGNAT relies on (warnings only: an
+    # outage of a free service shouldn't turn the build red).
+    ep = hosting.stun_probe()
+    print(f"[{'PASS' if ep else 'WARN'}] real STUN ({hosting.STUN_SERVERS}): public address {ep}", flush=True)
+    try:
+        box = hosting.Mailbox(f"ci-{time.time()}", hosting.new_short_code())
+        box.publish({"t": "host", "ep": ["192.0.2.1", 9000], "ts": int(time.time())})
+        got = box.fetch()
+        good = any(m.get("t") == "host" for m in got)
+        print(f"[{'PASS' if good else 'WARN'}] real mailbox ({hosting.MAILBOX_URL}): published and read back "
+              f"an encrypted message ({len(got)} found)", flush=True)
+    except OSError as e:
+        print(f"[WARN] real mailbox ({hosting.MAILBOX_URL}) unreachable: {e}", flush=True)
+
     if sys.platform == "win32":
         gw = hosting.default_gateway()
         print(f"       default gateway from 'route print': {gw}", flush=True)
