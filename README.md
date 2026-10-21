@@ -11,16 +11,17 @@ into the same switch.
   Each pair decides this on its own.
 - A **virtual network adapter** (Wintun on Windows) carries game traffic,
   LAN broadcasts and multicast discovery through those connections.
-- The app window is a live dashboard. It shows each connection's state as it
-  changes, and has buttons that force path changes during a demo.
+- The app is a native Windows program (Qt), not a web page. It shows each
+  connection's state live as it changes, and has buttons that force path
+  changes during a demo.
 
-![Dashboard with two players: carol direct, bob reconnecting after its direct path was dropped](docs/dashboard.png)
+![The app with three players: dave direct, bob on relay (forced), carol reconnecting after its direct path was dropped](docs/app.png)
 
 ```
-app.py                 the desktop app (what Rendezvous.exe runs)
-peer.py                the engine: per-player state machines, tunnel, virtual LAN routing, dashboard server
+app.py                 the desktop app (what Rendezvous.exe runs): native Qt window
+peer.py                the engine: per-player state machines, tunnel, virtual LAN routing; web dashboard for the CLI demo
 vnet.py                the virtual adapter: Wintun on Windows, /dev/net/tun on Linux
-dashboard.html         the dashboard (plain HTML/CSS/JS, served by the app)
+dashboard.html         the web dashboard used by the command-line demo (peer.py)
 rendezvous_server.py   rendezvous + relay + virtual IP assignment (stdlib only)
 udp_test.py            tiny UDP echo/send tool for testing (Windows has no netcat)
 run_demo.bat           one-laptop demo: server + three peers, no adapter needed
@@ -59,8 +60,16 @@ the *Rendezvous-windows* artifact). Then:
 The app remembers the network and rejoins it next time. Closing the window
 quits the app and removes the adapter.
 
+Select a player in the list (or click its node) to see its details. The
+**Force Relay / Re-punch / Drop Direct** buttons (keys R / P / D) then act on
+that player only, or on everyone when no player is selected.
+
 `Rendezvous-console.exe` is the same app with a console window showing the log,
 which helps with troubleshooting. Both write a log to `%APPDATA%\Rendezvous\`.
+Use **Network → Open log folder** to find it.
+
+To run the app from source instead: `py -m pip install -r requirements.txt`,
+then `py app.py` in an administrator terminal.
 
 ### 3. Play
 
@@ -79,7 +88,7 @@ which helps with troubleshooting. Both write a log to `%APPDATA%\Rendezvous\`.
   (`ping 10.77.0.x`). The app adds a firewall rule allowing inbound traffic
   from the virtual LAN. A game with its own firewall prompt still needs to be
   allowed.
-- **The virtual LAN shows an error on the dashboard**: the app wasn't started as
+- **The app shows "Virtual LAN unavailable"**: it wasn't started as
   administrator. The tunnel and chat still work.
 
 ## Demo on one laptop (no admin, no adapter)
@@ -248,8 +257,9 @@ relays only for the address a peer registered from.
 --punch-timeout S      punch this long before falling back (default 5)
 --relay-retry S        retry direct every S seconds while on relay (default 30, 0 = never)
 --block-direct         simulate an un-punchable NAT
---open                 open the dashboard in a browser (peer.py)
---no-window            app only: no window, keep running until Ctrl+C
+--open                 open the web dashboard in a browser (peer.py)
+--no-vlan              app only: no virtual adapter (chat/demo only)
+--api                  app only: also serve the JSON API / web dashboard (used by tests)
 --verbose              log every packet decision
 ```
 

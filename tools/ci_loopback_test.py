@@ -8,6 +8,7 @@ joins and brings up its virtual LAN.
 """
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -80,7 +81,9 @@ def main():
     ok.append(wait(lambda: states(8180) == ["DIRECT", "DIRECT"], 8, "Re-punch -> back to DIRECT"))
 
     if args.exe:
-        start([args.exe, "--no-window", "--server", "127.0.0.1:9100", "--room", "ci", "--name", "exe",
+        # The app is a Qt window; --api adds the JSON API so the test can watch it.
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        start([args.exe, "--api", "--server", "127.0.0.1:9100", "--room", "ci", "--name", "exe",
                "--http-port", "8190"], "ci-exe.log")
         ok.append(wait(lambda: len(api(8190)["peers"]) == 3 and all(p["state"] == "DIRECT" for p in api(8190)["peers"]),
                        40, "built exe joins and goes DIRECT with all 3 peers"))

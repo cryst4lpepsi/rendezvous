@@ -43,10 +43,6 @@ import threading
 import time
 from pathlib import Path
 
-import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
-
 from rendezvous_server import disable_udp_connreset
 
 log = logging.getLogger("peer")
@@ -221,10 +217,10 @@ class Peer:
         self.chat = collections.deque(maxlen=100)
         self.event_seq = 0
         self.seen_ctl = collections.deque(maxlen=200)
-        self.clients = set()           # one asyncio.Queue per open dashboard
-        self.had_client = False
-        self.no_clients_since = None
-        self.http_server = None        # uvicorn.Server, so the app can quit itself
+        self.clients = set()           # one asyncio.Queue per open web dashboard
+        self.listeners = []            # callables(obj) for in-process UIs (the desktop app)
+        self.http_server = None        # uvicorn.Server, if the web dashboard is running
+        self.stopped = None            # asyncio.Event, set by quit()
 
         self.loop = None
         self.transport = None
@@ -253,6 +249,7 @@ class Peer:
     # ================================================================ startup
     async def start(self):
         self.loop = asyncio.get_running_loop()
+        self.stopped = asyncio.Event()
         sock = make_udp_socket(self.args.bind, self.args.udp_port)
         self.transport, _ = await self.loop.create_datagram_endpoint(
             lambda: _Proto(self._on_datagram), sock=sock)
@@ -362,6 +359,8 @@ class Peer:
         self.broadcast(ev)
 
     def broadcast(self, obj):
+        for fn in self.listeners:
+            fn(obj)
         for q in list(self.clients):
             try:
                 q.put_nowait(obj)
@@ -450,7 +449,6 @@ class Peer:
 
     def _tick(self):
         t = now()
-        self._tick_app_lifetime(t)
         if self.joined:
             if t - self.last_register >= REGISTER_INTERVAL:
                 self._register()
@@ -538,21 +536,9 @@ class Peer:
             self.set_state(link, RELAY, f"hole punching timed out after {link.punch_round_attempts} attempts "
                                         f"({self.punch_timeout:.0f}s) - falling back to relay via server", "warn")
 
-    def _tick_app_lifetime(self, t):
-        # In app mode, closing the window means quitting: once a dashboard has
-        # connected, exit when none has been open for a few seconds (a page
-        # reload reconnects well within that).
-        if not self.args.exit_when_closed or not self.had_client:
-            return
-        if self.clients:
-            self.no_clients_since = None
-        elif self.no_clients_since is None:
-            self.no_clients_since = t
-        elif t - self.no_clients_since > 6:
-            log.info("app window closed, shutting down")
-            self.quit()
-
     def quit(self):
+        if self.stopped:
+            self.stopped.set()
         if self.http_server:
             self.http_server.should_exit = True
 
@@ -879,7 +865,10 @@ class Peer:
     def command(self, m):
         cmd = m.get("cmd")
         if cmd == "join":
-            return self.join(m.get("server"), m.get("network"), m.get("password") or "", m.get("name"))
+            pw = m.get("password")
+            if pw is None:  # "keep the saved password"
+                pw = self.config.get("password") or ""
+            return self.join(m.get("server"), m.get("network"), pw, m.get("name"))
         if cmd == "rejoin":
             c = self.config
             return self.join(c.get("server"), c.get("network"), c.get("password") or "", c.get("name"))
@@ -939,6 +928,9 @@ class Peer:
 
 # ==================================================================== web app
 def build_app(peer: Peer):
+    from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+    from fastapi.responses import HTMLResponse, JSONResponse
+
     app = FastAPI(title="rendezvous peer dashboard")
 
     @app.get("/")
@@ -959,7 +951,6 @@ def build_app(peer: Peer):
         await sock.accept()
         q = asyncio.Queue(maxsize=2000)
         peer.clients.add(q)
-        peer.had_client = True
         try:
             await sock.send_json({"type": "hello", "events": list(peer.events), "chat": list(peer.chat)})
             await sock.send_json(peer.snapshot())
@@ -992,19 +983,21 @@ def stdin_chat(loop, peer):
         loop.call_soon_threadsafe(peer.send_chat, line)
 
 
-async def run(args, on_ready=None):
-    peer = Peer(args)
-    await peer.start()
+def autojoin(peer, args):
+    """Join from the command line, else the remembered network, else (plain
+    peer.py only) the zero-config local demo."""
     if args.server or args.room:
         peer.join(args.server or "127.0.0.1:9000", args.room or "demo", args.password or "", remember=False)
     elif peer.config.get("autojoin") and peer.config.get("network"):
         c = peer.config
         peer.join(c.get("server"), c["network"], c.get("password") or "", c.get("name"))
     elif not args.app_mode:
-        peer.join("127.0.0.1:9000", "demo", remember=False)  # zero-config local demo
+        peer.join("127.0.0.1:9000", "demo", remember=False)
 
-    if sys.stdin and sys.stdin.isatty() and not args.app_mode:
-        threading.Thread(target=stdin_chat, args=(asyncio.get_running_loop(), peer), daemon=True).start()
+
+async def serve_http(peer, args):
+    """The web dashboard + JSON API. Returns when quit() is called or on Ctrl+C."""
+    import uvicorn
     server = uvicorn.Server(uvicorn.Config(build_app(peer), host=args.http_host, port=args.http_port,
                                            log_level="warning", lifespan="off",
                                            log_config=None))  # we configure logging; also safe with no console
@@ -1016,15 +1009,22 @@ async def run(args, on_ready=None):
     async def announce():
         while not server.started:
             await asyncio.sleep(0.05)
-        if on_ready:
-            on_ready(url)
-        elif args.open:
+        if args.open:
             import webbrowser
             webbrowser.open(url)
 
     asyncio.ensure_future(announce())
+    await server.serve()
+
+
+async def run(args):
+    peer = Peer(args)
+    await peer.start()
+    autojoin(peer, args)
+    if sys.stdin and sys.stdin.isatty():
+        threading.Thread(target=stdin_chat, args=(asyncio.get_running_loop(), peer), daemon=True).start()
     try:
-        await server.serve()
+        await serve_http(peer, args)
     finally:
         await peer.stop()
 
@@ -1049,7 +1049,7 @@ def build_parser():
     ap.add_argument("--config", help="settings file to remember the last network (used by the app)")
     ap.add_argument("--open", action="store_true", help="open the dashboard in a browser")
     ap.add_argument("--verbose", "-v", action="store_true", help="log every packet decision")
-    ap.set_defaults(app_mode=False, exit_when_closed=False)
+    ap.set_defaults(app_mode=False)
     return ap
 
 

@@ -36,6 +36,7 @@ jobs:
           pyinstaller --noconfirm --onefile --windowed --uac-admin --name Rendezvous
           --add-data "dashboard.html;." --add-binary "wintun.dll;."
           --hidden-import vnet --collect-submodules uvicorn --collect-submodules websockets
+          --exclude-module tkinter
           app.py
 
       - name: Build Rendezvous-console.exe (same app, shows its log in a console)
@@ -43,6 +44,7 @@ jobs:
           pyinstaller --noconfirm --onefile --console --uac-admin --name Rendezvous-console
           --add-data "dashboard.html;." --add-binary "wintun.dll;."
           --hidden-import vnet --collect-submodules uvicorn --collect-submodules websockets
+          --exclude-module tkinter
           app.py
 
       - name: Package
@@ -63,3 +65,19 @@ jobs:
       - name: Test - mesh on Windows loopback + the built exe
         if: always()
         run: python tools/ci_loopback_test.py --exe dist/Rendezvous-console.exe
+
+      - name: Screenshot the app window on Windows
+        if: always()
+        shell: pwsh
+        run: |
+          $p = Start-Process python -ArgumentList "rendezvous_server.py","--port","9200","--http-port","0" -PassThru
+          Start-Sleep 1
+          $b = Start-Process python -ArgumentList "peer.py","--server","127.0.0.1:9200","--room","shot","--name","bob","--http-port","8281" -PassThru
+          dist/Rendezvous-console.exe --server 127.0.0.1:9200 --room shot --name alice --screenshot "$PWD/app-window.png:6" | Out-Host
+          Stop-Process -Id $p.Id, $b.Id -ErrorAction SilentlyContinue
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: app-window-screenshot
+          path: app-window.png
