@@ -15,8 +15,8 @@ Sizes are in **bytes (B)** unless marked **bits (b)**. ★ = most likely to be a
 **A web request on the wire:**
 `[Preamble 7 | SFD 1] [Eth 14] [IPv4 20] [TCP 20] [HTTP …] [FCS 4]`
 
-**Our project's tunnel packet:** a game packet inside our packet.
-`[Eth 14] [IPv4 20] [UDP 8] [type 1 + player-id 3] [inner IPv4 20] [inner TCP/UDP] [game data] [FCS 4]`
+**A DNS query on the wire:**
+`[Eth 14] [IPv4 20] [UDP 8] [DNS 12 + question] [FCS 4]`
 
 ---
 
@@ -426,36 +426,7 @@ Set-Cookie: id=42
 
 ---
 
-## 5. Project-specific packets (to show off in the viva)
-
-### STUN message (RFC 5389): our "what's my public address" request
-| Message type 2 B | Message length 2 B | **Magic cookie 4 B = 0x2112A442** | **Transaction ID 12 B** | Attributes (TLV) |
-|---|---|---|---|---|
-
-- The header is 20 B.
-- Message types: **0x0001 Binding Request**, **0x0101 Binding Success
-  Response**.
-- The answer is in the **XOR-MAPPED-ADDRESS** attribute (0x0020): our public
-  IP:port, XOR-ed with the magic cookie so NATs don't "helpfully" rewrite it.
-- **TURN** (RFC 5766) uses the same format, with methods **Allocate,
-  Refresh, CreatePermission** and **Send/Data indications** for relayed
-  packets.
-
-### Our tunnel's own formats (over UDP)
-| First byte | Rest | Meaning |
-|---|---|---|
-| `{` | JSON text | control: register, peer, punch, punch_ack, ping, pong, chat, relay… |
-| **0x01** | sender id (3 B) + IP packet | game packet, **direct** path |
-| **0x02** | target id (3 B) + IP packet | game packet **to** the relay server |
-| **0x03** | sender id (3 B) + IP packet | game packet **from** the relay server |
-
-That is 4 B of overhead per game packet (+ UDP 8 + IP 20 outside). That's why
-the virtual adapter's MTU is **1280**: the packet still fits inside Ethernet's
-1500.
-
----
-
-## 6. Numbers to remember
+## 5. Numbers to remember
 
 | Thing | Size |
 |---|---|
@@ -475,11 +446,10 @@ the virtual adapter's MTU is **1280**: the packet still fits inside Ethernet's
 | OSPF header | 24 B |
 | BGP header | 19 B |
 | RIP | 4 B header + 20 B per route, ≤ 25 routes |
-| STUN header | 20 B |
 | Max IP datagram | 65,535 B |
 | Max ports | 65,535 (16 b) |
 
-## 7. Ports to remember
+## 6. Ports to remember
 
 | Port | Protocol | | Port | Protocol |
 |---|---|---|---|---|
@@ -489,5 +459,5 @@ the virtual adapter's MTU is **1280**: the packet still fits inside Ethernet's
 | 25 | SMTP | | 179 | BGP (TCP) |
 | 53 | DNS | | 443 | HTTPS |
 | 67/68 | DHCP server/client | | 520 | RIP (UDP) |
-| 69 | TFTP | | 3478 | STUN/TURN |
-| 80 | HTTP | | 1900 | SSDP (UPnP discovery) |
+| 69 | TFTP | | 587 | SMTP submission |
+| 80 | HTTP | | 993 / 995 | IMAPS / POP3S |
