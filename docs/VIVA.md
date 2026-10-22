@@ -8,6 +8,7 @@ How to use this:
    line: say it. It shows you understand the theory, not just the syllabus.
 4. Section 8 is the glossary of every abbreviation and buzzword.
 5. Section 9 has worked numericals (CRC, Hamming, subnetting, checksum, ALOHA).
+6. Every header and packet format, field by field: [HEADERS.md](HEADERS.md).
 
 ---
 
