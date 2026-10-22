@@ -24,7 +24,9 @@ into the same switch.
 
 **New here, or preparing a presentation?** [docs/PROJECT.md](docs/PROJECT.md)
 explains the project in plain words, and has a demo script, a troubleshooting
-table and viva questions with answers.
+table and viva questions with answers. [docs/VIVA.md](docs/VIVA.md) covers the
+Computer Networks syllabus (units I–V) with answers tied to this project, a
+glossary of every abbreviation, and worked numericals.
 
 ![The app with three players: dave direct, bob on relay (forced), carol reconnecting after its direct path was dropped](docs/app.png)
 

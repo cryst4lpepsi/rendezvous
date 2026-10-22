@@ -66,7 +66,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory release | Out-Null
-          Copy-Item dist/Rendezvous.exe, dist/Rendezvous-console.exe, rendezvous_server.py, README.md, docs/PROJECT.md release/
+          Copy-Item dist/Rendezvous.exe, dist/Rendezvous-console.exe, rendezvous_server.py, README.md, docs/PROJECT.md, docs/VIVA.md release/
 
       - uses: actions/upload-artifact@v4
         with:
@@ -104,6 +104,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release delete latest --yes --cleanup-tag || true
-          gh release create latest release/Rendezvous.exe release/Rendezvous-console.exe release/rendezvous_server.py release/PROJECT.md \
+          gh release create latest release/Rendezvous.exe release/Rendezvous-console.exe release/rendezvous_server.py release/PROJECT.md release/VIVA.md \
             --target ${{ github.sha }} --prerelease --title "Rendezvous - latest build" \
             --notes "Download **Rendezvous.exe** and run it (accept the administrator prompt). Built from ${{ github.sha }} on branch ${{ github.ref_name }} after all tests passed."

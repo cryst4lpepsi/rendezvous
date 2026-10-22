@@ -1,5 +1,8 @@
 # Rendezvous: project explainer, demo script and viva notes
 
+For syllabus-wise viva prep (units I–V), a glossary of every abbreviation and
+worked numericals, see [VIVA.md](VIVA.md).
+
 ## 1. What it is, in plain words
 
 Some games (Minecraft Java "Open to LAN", older RTS and shooter games, many
